@@ -1,0 +1,471 @@
+1. Objetivo
+
+Predecir la dirección del próximo minuto (up/down) para EUR/USD (OTC).
+
+Mostrar predicciones en tiempo real sobre un gráfico web interactivo.
+
+Mantener un porcentaje de éxito que se actualiza dinámicamente (time-weighted) para indicar desempeño real.
+
+Sistema autoaprendiz: mejora continua usando datos reales y backtest online.
+
+2. Requisitos funcionales
+
+Fuente de precios en tiempo real (tick/quote) para EUR/USD (OTC) con baja latencia.
+
+Web UI con gráfico en tiempo real (candles 1m, ticks) y overlay de predicciones (señal y confianza).
+
+Motor ML que genere predicciones cada minuto y las exponga vía API / websocket.
+
+Módulo de autoaprendizaje: reentrenamiento incremental o por batches según rendimiento.
+
+Dashboard de métricas: precisión, F1, AUC (si aplica), y porcentaje de éxito dinámico.
+
+Backtesting engine para validar estrategias históricas y simular slippage/commission.
+
+Registro (logs) y telemetría (latencias, errores, drift de datos).
+
+3. Arquitectura general (alto nivel)
+
+Data Ingest: Conexión a feed (WebSocket/REST) -> Normalización -> Buffer de ticks
+
+Feature Engine: Agregación a 1m, cálculo de features técnicos y contextuales
+
+Model Serving: Servicio de inferencia (fast API + GPU/CPU) -> devuelve señal y probabilidad
+
+Decision Layer: Umbrales, reglas de negocio y cálculo del porcentaje de éxito
+
+UI / Websocket: Gráfico en el navegador; recibe ticks y señales
+
+Training / Autoaprendizaje: Colas de datos etiquetados -> reentrenamiento incremental / batch -> validación -> despliegue
+
+Storage: TSDB (InfluxDB / Timescale) para ticks; object storage para modelos y dataset (S3)
+
+Monitoring: Prometheus + Grafana, alertas
+
+Diagrama simplificado: Data Feed -> Feature Engine -> Model -> API -> UI
+
+4. Fuentes de datos y latencia
+
+Feed recomendado: Broker/market-data provider con OTC EUR/USD (WebSocket). Debe proveer ticks y quotes (bid/ask) y ejecución de demo para simulación.
+
+Almacenamiento temporal: Redis pub/sub para transmisión en tiempo real.
+
+Persistencia: TimescaleDB/InfluxDB para series históricas.
+
+Latencia objetivo: < 200ms para ingest -> feature -> inferencia en camino hacia el cierre del minuto.
+
+5. Ingeniería de features (1-min horizon)
+A. Features basadas en precio
+
+OHLCV 1m (open, high, low, close, volume)
+
+Returns: log-return del cierre (t) y ventanas pasadas (1,2,3,5,10 minutos)
+
+High-low spread, candle body/upper/lower wick ratios
+
+B. Momentum / Volatility
+
+SMA/EMA (varias longitudes: 3, 5, 13, 50)
+
+RSI (14), Stochastic, MACD (12,26,9)
+
+ATR (14) normalizado por precio
+
+C. Microstructure (si hay ticks)
+
+Order flow proxies: buy/sell tick imbalance, trade count por minuto
+
+Bid-ask spread, mid-price moves
+
+D. Contextuales / Calendario
+
+Hora del día (síncos), día de la semana
+
+Eventos macro simples (opcional: si se pueden fetch en tiempo real)—marcar high-impact
+
+E. Features derivados para online learning
+
+Rolling features con decay exponencial (para adaptarse a regime shifts)
+
+6. Modelo y enfoque de IA (autoaprendiz)
+Recomendación arquitectónica
+
+Ensemble híbrido:
+
+Modelo secuencial ligero: Temporal ConvNet (TCN) o Transformer pequeño para captura de patrones intraminuto.
+
+Modelo tabular: LightGBM/XGBoost para features agregadas.
+
+Meta-modelo: Logistic regression o calibrador (Platt isotonic) que combine outputs de ambos.
+
+Formato de salida
+
+Clase binaria {UP, DOWN} + probabilidad/confianza (p)
+
+Entrenamiento inicial
+
+Dataset histórico de ticks/candles (últimos N meses) con walk-forward validation.
+
+Cross-validation por bloques temporales (time-series split).
+
+Estrategia de autoaprendizaje
+
+Online incremental: incorporar batches del último día/semana para actualizar modelos ligeros (p.ej., recalibrar LR o actualizar LightGBM con warm-start si lo soporta).
+
+Retraining programado: retrain completo semanal/diario en ventana deslizante (p.ej., últimos 30 días) si la métrica cae por debajo del umbral.
+
+Concept drift detection: usar tests estadísticos y distancia en embeddings de features para detectar drift y disparar retraining.
+
+Validación: before deploy — validación en holdout que simula latencia y slippage.
+
+7. Cálculo del “porcentaje de éxito dinámico”
+
+Definición: % de predicciones correctas en una ventana temporal ponderada.
+
+Fórmula sugerida
+
+Usar una ventana 
+𝑊
+W (p. ej. 24h o 500 señales) y un decay exponencial con factor 
+𝛼
+α:
+
+𝑠
+𝑐
+𝑜
+𝑟
+𝑒
+𝑡
+=
+∑
+𝑖
+=
+1
+𝑁
+𝑤
+𝑖
+∗
+𝑐
+𝑜
+𝑟
+𝑟
+𝑒
+𝑐
+𝑡
+𝑖
+∑
+𝑖
+=
+1
+𝑁
+𝑤
+𝑖
+score
+t
+	​
+
+=
+∑
+i=1
+N
+	​
+
+w
+i
+	​
+
+∑
+i=1
+N
+	​
+
+w
+i
+	​
+
+∗correct
+i
+	​
+
+	​
+
+
+
+
+Donde 
+𝑤
+𝑖
+=
+𝑒
+−
+𝛼
+(
+𝑡
+𝑛
+𝑜
+𝑤
+−
+𝑡
+𝑖
+)
+w
+i
+	​
+
+=e
+−α(t
+now
+	​
+
+−t
+i
+	​
+
+)
+ y 
+𝑐
+𝑜
+𝑟
+𝑟
+𝑒
+𝑐
+𝑡
+𝑖
+correct
+i
+	​
+
+ es 1 si la predicción fue correcta a 1 minuto, 0 en caso contrario.
+
+Mostrar además: precisión por hora, por paridad y por sesión (London, New York).
+
+Calcular también rendimiento por cuantiles de confianza (p>0.6, p>0.7, etc.) para mostrar si la confianza se correlaciona con la precisión.
+
+8. UI / UX (minimalista)
+Principios
+
+Muy pocos elementos: gráfico central + botón play/pause + indicador de señal + barra de rendimiento.
+
+Color coding simple: verde = predicción UP, rojo = DOWN, gris = neutral.
+
+Componentes
+
+Gráfico principal: candles 1m, con overlay de flechas (predicción) y banda de confidence.
+
+Panel izquierdo: información actual — precio, spread, última señal (UP/DOWN), probabilidad.
+
+Panel inferior: historial de señales (tabla compacta) y porcentaje de éxito dinámico.
+
+Configuración: selector de ventana para score (1h/24h/7d), toggle para ver features, slider para umbral de confianza.
+
+Interactividad
+
+Click en flecha -> muestra mini-popup con features usados y explicación (SHAP / feature importance corta).
+
+Websocket para streaming, charting con librería: Lightweight options: TradingView widget (si se licencia), or Plotly.js/ApexCharts para integración propia.
+
+9. API y mensajes en tiempo real
+
+WebSocket channels:
+
+/ticks -> ticks real-time
+
+/candles/1m -> candle cerrado o candle parcial
+
+/signals -> {timestamp, direction, prob, model_version}
+
+REST endpoints:
+
+GET /metrics -> retorna precisión, F1, últimas N señales
+
+POST /feedback -> permite marcar manualmente resultados (opcional)
+
+10. Backtesting y simulación
+
+Simular ejecución de señales en historial con: realistic spread, slippage, latency cost.
+
+Métricas: accuracy, precision/recall, trade P&L (si pricing available), max drawdown, sharpe (si pl disponible).
+
+Walk-forward backtesting: split in-sample / out-of-sample deslizante.
+
+11. Monitoring, observabilidad y seguridad
+
+Instrumentar latencias y errores (Prometheus), dashboards (Grafana).
+
+Alerts: si score cae > X puntos, o si latency > 1s.
+
+Secure credentials, encrypt data at rest, TLS for sockets.
+
+Rate limiting on API and auth tokens for users.
+
+12. Infra & tech stack sugerido
+
+Ingest / Streaming: WebSocket client, Redis Pub/Sub
+
+TSDB: TimescaleDB o InfluxDB
+
+Model infra: Python (FastAPI) + PyTorch/TensorFlow + LightGBM
+
+Feature store: Redis/feature pipeline with Airflow or Prefect for batch
+
+Storage: S3-compatible
+
+UI: React + ApexCharts/TradingView, WebSocket client
+
+Containers: Docker, Kubernetes for scaling
+
+CI/CD: GitHub Actions, model registry (MLflow)
+
+13. Seguridad legal y advertencias
+
+Dejar claro que es una herramienta informativa: no es recomendación financiera.
+
+Registrar disclaimers, cumplir regulación local si se integra con ejecución real.
+
+Protección de datos personales si se recolecta.
+
+14. Roadmap de implementación (MVP -> Prod)
+
+MVP (2-4 semanas)
+
+Ingest de datos demo (1 month history) + persistencia
+
+Feature pipeline básico (OHLC + returns + EMA)
+
+Modelo baseline (LightGBM) + REST inferencia
+
+UI minimal con gráfico 1m, websocket de señales y score dinámico
+
+Phase 2 (4-8 semanas)
+
+Ensemble con TCN/Transformer
+
+Autoaprendiz básico: retrain nightly + drift detection
+
+Backtesting engine
+
+Phase 3 (8-16 semanas)
+
+Deploy en K8s, escalabilidad
+
+Explainability (SHAP), advanced monitoring
+
+Integración con ejecución (opcional) y sandbox trading
+
+15. Métricas clave (KPIs)
+
+Accuracy a 1 minuto (global y por hora)
+
+Precision/Recall por umbral de confianza
+
+Porcentaje de éxito dinámico (time-decay)
+
+Latencia end-to-end
+
+Backtested P&L y max drawdown (si aplica)
+
+16. Riesgos y limitaciones
+
+Ruido alto en horizontes de 1 minuto -> señales frágiles
+
+Sobreajuste a microestructura de un proveedor de datos
+
+Latencia y slippage pueden anular ventaja predictiva
+
+Cambios de régimen macro o eventos imprevistos pueden degradar performance
+
+17. Ejemplo de pipeline - pseudocódigo (resumido)
+    tick = ws.read()1. Objetivo
+
+
+Phase 2 (4-8 semanas)
+
+
+Ensemble con TCN/Transformer
+
+
+Autoaprendiz básico: retrain nightly + drift detection
+
+
+Backtesting engine
+
+
+Phase 3 (8-16 semanas)
+
+
+Deploy en K8s, escalabilidad
+
+
+Explainability (SHAP), advanced monitoring
+
+
+Integración con ejecución (opcional) y sandbox trading
+
+
+15. Métricas clave (KPIs)
+Accuracy a 1 minuto (global y por hora)
+
+
+Precision/Recall por umbral de confianza
+
+
+Porcentaje de éxito dinámico (time-decay)
+
+
+Latencia end-to-end
+
+
+Backtested P&L y max drawdown (si aplica)
+
+
+16. Riesgos y limitaciones
+Ruido alto en horizontes de 1 minuto -> señales frágiles
+
+
+Sobreajuste a microestructura de un proveedor de datos
+
+
+Latencia y slippage pueden anular ventaja predictiva
+
+
+Cambios de régimen macro o eventos imprevistos pueden degradar performance
+
+
+17. Ejemplo de pipeline - pseudocódigo (resumido)
+# flujo simplificado
+while True:
+    tick = ws.read()
+    redis.publish('ticks', tick)
+    if minute_closed():
+        candle = aggregate_ticks()
+        features = featurize(candle, history)
+        signal, prob = model.predict(features)
+        websocket.broadcast('/signals', {ts: now(), signal, prob, model_v})
+        store_signal({ts, features, signal, prob})
+18. Siguientes pasos sugeridos
+Seleccionar proveedor de datos y obtener sample feed.
+
+
+Preparar 1-2 semanas de datos históricos y hacer primer backtest con modelo baseline.
+
+
+Construir UI mínimo para visualización y recibir feedback de usuario.
+
+
+Iterar en features y strategy de autoaprendizaje.
+    redis.publish('ticks', tick)
+    if minute_closed():
+        candle = aggregate_ticks()
+        features = featurize(candle, history)
+        signal, prob = model.predict(features)
+        websocket.broadcast('/signals', {ts: now(), signal, prob, model_v})
+        store_signal({ts, features, signal, prob})
+18. Siguientes pasos sugeridos
+
+Seleccionar proveedor de datos y obtener sample feed.
+
+Preparar 1-2 semanas de datos históricos y hacer primer backtest con modelo baseline.
+
+Construir UI mínimo para visualización y recibir feedback de usuario.
+
+Iterar en features y strategy de autoaprendizaje.
