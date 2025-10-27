@@ -63,7 +63,10 @@ export class MemStorage implements IStorage {
     const tick: Tick = {
       id: randomUUID(),
       timestamp: new Date(),
-      ...insertTick,
+      pair: insertTick.pair || "EUR/USD",
+      bid: insertTick.bid,
+      ask: insertTick.ask,
+      mid: insertTick.mid,
     };
     this.ticks.push(tick);
     // Keep only last 10000 ticks in memory
@@ -81,7 +84,13 @@ export class MemStorage implements IStorage {
   async createCandle(insertCandle: InsertCandle): Promise<Candle> {
     const candle: Candle = {
       id: randomUUID(),
-      ...insertCandle,
+      timestamp: insertCandle.timestamp,
+      pair: insertCandle.pair || "EUR/USD",
+      open: insertCandle.open,
+      high: insertCandle.high,
+      low: insertCandle.low,
+      close: insertCandle.close,
+      volume: insertCandle.volume || 0,
     };
     this.candles.push(candle);
     // Keep only last 1440 candles (24 hours at 1min intervals)
@@ -104,7 +113,15 @@ export class MemStorage implements IStorage {
     const signal: Signal = {
       id: randomUUID(),
       timestamp: new Date(),
-      ...insertSignal,
+      pair: insertSignal.pair || "EUR/USD",
+      direction: insertSignal.direction,
+      probability: insertSignal.probability,
+      modelVersion: insertSignal.modelVersion,
+      features: insertSignal.features || null,
+      actualDirection: insertSignal.actualDirection || null,
+      isCorrect: insertSignal.isCorrect !== undefined ? insertSignal.isCorrect : null,
+      priceAtPrediction: insertSignal.priceAtPrediction || null,
+      priceAfterMinute: insertSignal.priceAfterMinute || null,
     };
     this.signals.push(signal);
     // Keep only last 1000 signals
