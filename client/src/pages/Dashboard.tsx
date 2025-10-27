@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import PriceDisplay from "@/components/PriceDisplay";
 import SignalIndicator from "@/components/SignalIndicator";
 import MetricCard from "@/components/MetricCard";
@@ -9,20 +9,144 @@ import PerformanceMetrics from "@/components/PerformanceMetrics";
 import ControlPanel from "@/components/ControlPanel";
 import ThemeToggle from "@/components/ThemeToggle";
 import { Activity, Target, Zap } from "lucide-react";
+import { wsClient } from "@/lib/websocket";
+import { type Signal } from "@shared/schema";
+
+interface MetricsData {
+  accuracy: number;
+  precision: number;
+  recall: number;
+  totalSignals: number;
+  correctSignals: number;
+  dynamicSuccessRate: number;
+}
 
 export default function Dashboard() {
   const [isRunning, setIsRunning] = useState(true);
+  const [isConnected, setIsConnected] = useState(false);
+  const [currentPrice, setCurrentPrice] = useState(1.08734);
+  const [priceChange, setPriceChange] = useState(0.00123);
+  const [priceChangePercent, setPriceChangePercent] = useState(0.11);
+  const [latency, setLatency] = useState(45);
+  const [lastUpdate, setLastUpdate] = useState("2s ago");
+  const [signals, setSignals] = useState<Signal[]>([]);
+  const [latestSignal, setLatestSignal] = useState<Signal | null>(null);
+  const [metrics, setMetrics] = useState<MetricsData>({
+    accuracy: 0.673,
+    precision: 0.71,
+    recall: 0.68,
+    totalSignals: 0,
+    correctSignals: 0,
+    dynamicSuccessRate: 0.673,
+  });
 
-  const mockSignals = [
-    { id: "1", timestamp: "14:32:45", direction: "UP" as const, probability: 0.73, result: "correct" as const, actualMove: 0.00012 },
-    { id: "2", timestamp: "14:31:45", direction: "DOWN" as const, probability: 0.68, result: "correct" as const, actualMove: -0.00008 },
-    { id: "3", timestamp: "14:30:45", direction: "UP" as const, probability: 0.61, result: "incorrect" as const, actualMove: -0.00003 },
-    { id: "4", timestamp: "14:29:45", direction: "DOWN" as const, probability: 0.75, result: "correct" as const, actualMove: -0.00015 },
-    { id: "5", timestamp: "14:28:45", direction: "UP" as const, probability: 0.58, result: "incorrect" as const, actualMove: -0.00005 },
-    { id: "6", timestamp: "14:27:45", direction: "DOWN" as const, probability: 0.82, result: "correct" as const, actualMove: -0.00018 },
-    { id: "7", timestamp: "14:26:45", direction: "UP" as const, probability: 0.64, result: "correct" as const, actualMove: 0.00009 },
-    { id: "8", timestamp: "14:25:45", direction: "DOWN" as const, probability: 0.59, result: "incorrect" as const, actualMove: 0.00004 },
-  ];
+  useEffect(() => {
+    // Connect to WebSocket
+    wsClient.connect();
+
+    // Connection status listener
+    wsClient.on("connection", (data: { connected: boolean }) => {
+      setIsConnected(data.connected);
+    });
+
+    // Initial state listener
+    wsClient.on("initial_state", (data: any) => {
+      console.log("[Dashboard] Received initial state:", data);
+      
+      if (data.signals && data.signals.length > 0) {
+        setSignals(data.signals);
+        setLatestSignal(data.signals[0]);
+      }
+      
+      if (data.metrics) {
+        setMetrics({
+          accuracy: data.metrics.accuracy || 0.673,
+          precision: data.metrics.precision || 0.71,
+          recall: data.metrics.recall || 0.68,
+          totalSignals: data.metrics.totalSignals || 0,
+          correctSignals: data.metrics.correctSignals || 0,
+          dynamicSuccessRate: data.metrics.dynamicSuccessRate || 0.673,
+        });
+      }
+
+      if (data.ticks && data.ticks.length > 0) {
+        const latestTick = data.ticks[0];
+        setCurrentPrice(latestTick.mid);
+      }
+    });
+
+    // Tick listener
+    wsClient.on("tick", (tick: any) => {
+      const newPrice = tick.mid;
+      const change = newPrice - currentPrice;
+      const changePercent = (change / currentPrice) * 100;
+      
+      setCurrentPrice(newPrice);
+      setPriceChange(change);
+      setPriceChangePercent(changePercent);
+      setLastUpdate("just now");
+    });
+
+    // Signal listener
+    wsClient.on("signal", (signal: Signal) => {
+      console.log("[Dashboard] New signal:", signal);
+      setLatestSignal(signal);
+      setSignals((prev) => [signal, ...prev].slice(0, 20));
+    });
+
+    // Metrics listener
+    wsClient.on("metrics", (metricsData: any) => {
+      console.log("[Dashboard] Metrics update:", metricsData);
+      if (metricsData) {
+        setMetrics({
+          accuracy: metricsData.accuracy || metrics.accuracy,
+          precision: metricsData.precision || metrics.precision,
+          recall: metricsData.recall || metrics.recall,
+          totalSignals: metricsData.totalSignals || metrics.totalSignals,
+          correctSignals: metricsData.correctSignals || metrics.correctSignals,
+          dynamicSuccessRate: metricsData.dynamicSuccessRate || metrics.dynamicSuccessRate,
+        });
+      }
+    });
+
+    return () => {
+      wsClient.disconnect();
+    };
+  }, []);
+
+  const handlePlayPause = async (running: boolean) => {
+    setIsRunning(running);
+    try {
+      const endpoint = running ? "/api/control/start" : "/api/control/stop";
+      await fetch(endpoint, { method: "POST" });
+    } catch (error) {
+      console.error("Error controlling simulation:", error);
+    }
+  };
+
+  const formatSignalsForHistory = (sigs: Signal[]) => {
+    return sigs.map((s) => ({
+      id: s.id,
+      timestamp: new Date(s.timestamp).toLocaleTimeString(),
+      direction: s.direction as "UP" | "DOWN",
+      probability: s.probability,
+      result: s.isCorrect !== null && s.isCorrect !== undefined 
+        ? (s.isCorrect ? "correct" as const : "incorrect" as const)
+        : undefined,
+      actualMove: s.priceAfterMinute && s.priceAtPrediction 
+        ? s.priceAfterMinute - s.priceAtPrediction
+        : undefined,
+    }));
+  };
+
+  const getTimeAgo = (timestamp: Date): string => {
+    const seconds = Math.floor((Date.now() - new Date(timestamp).getTime()) / 1000);
+    if (seconds < 60) return `${seconds}s ago`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h ago`;
+  };
 
   return (
     <div className="min-h-screen bg-background">
@@ -35,12 +159,12 @@ export default function Dashboard() {
               </div>
               <h1 className="text-xl font-semibold">TradingML</h1>
             </div>
-            <ConnectionStatus isConnected={true} latency={45} lastUpdate="2s ago" />
+            <ConnectionStatus isConnected={isConnected} latency={latency} lastUpdate={lastUpdate} />
           </div>
           
           <div className="flex items-center gap-2">
             <ControlPanel 
-              onPlayPause={setIsRunning}
+              onPlayPause={handlePlayPause}
             />
             <ThemeToggle />
           </div>
@@ -52,23 +176,31 @@ export default function Dashboard() {
           <div className="lg:col-span-3 space-y-6">
             <div className="space-y-4">
               <PriceDisplay 
-                price={1.08734} 
-                change={0.00123} 
-                changePercent={0.11} 
+                price={currentPrice} 
+                change={priceChange} 
+                changePercent={priceChangePercent} 
               />
               
-              <SignalIndicator 
-                direction="UP" 
-                probability={0.73} 
-                timestamp="2s ago"
-              />
+              {latestSignal ? (
+                <SignalIndicator 
+                  direction={latestSignal.direction as "UP" | "DOWN"}
+                  probability={latestSignal.probability} 
+                  timestamp={getTimeAgo(latestSignal.timestamp)}
+                />
+              ) : (
+                <SignalIndicator 
+                  direction="NEUTRAL"
+                  probability={0.5} 
+                  timestamp="Waiting..."
+                />
+              )}
             </div>
 
             <PerformanceMetrics 
-              successRate={0.673}
-              precision={0.71}
-              recall={0.68}
-              totalSignals={1247}
+              successRate={metrics.dynamicSuccessRate}
+              precision={metrics.precision}
+              recall={metrics.recall}
+              totalSignals={metrics.totalSignals}
             />
           </div>
 
@@ -78,17 +210,16 @@ export default function Dashboard() {
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <MetricCard 
                 title="Accuracy" 
-                value="67.3%" 
-                subtitle="Last 24 hours"
+                value={`${(metrics.accuracy * 100).toFixed(1)}%`}
+                subtitle="Last 100 signals"
                 icon={Activity}
                 trend={{ value: 2.4, isPositive: true }}
               />
               <MetricCard 
                 title="Total Signals" 
-                value="1,247" 
+                value={metrics.totalSignals.toString()}
                 subtitle="This session"
                 icon={Target}
-                trend={{ value: -0.8, isPositive: false }}
               />
               <MetricCard 
                 title="Avg Confidence" 
@@ -99,7 +230,7 @@ export default function Dashboard() {
           </div>
 
           <div className="lg:col-span-3">
-            <SignalHistory signals={mockSignals} maxHeight="calc(100vh - 200px)" />
+            <SignalHistory signals={formatSignalsForHistory(signals)} maxHeight="calc(100vh - 200px)" />
           </div>
         </div>
       </main>
