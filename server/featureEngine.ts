@@ -158,28 +158,45 @@ export class FeatureEngine {
     return recentTR.reduce((sum, tr) => sum + tr, 0) / period;
   }
 
-  // Convert features to array for model input
+  // Convert features to array for model input with normalization
   featuresToArray(features: TechnicalFeatures): number[] {
+    const latest = features.sma_3; // Use as reference price
+    
     return [
-      features.returns_1m,
-      features.returns_2m,
-      features.returns_5m,
-      features.returns_10m,
+      // Returns are already normalized (log returns)
+      this.clamp(features.returns_1m * 100, -5, 5) / 5, // Normalize to [-1, 1]
+      this.clamp(features.returns_2m * 100, -5, 5) / 5,
+      this.clamp(features.returns_5m * 100, -10, 10) / 10,
+      this.clamp(features.returns_10m * 100, -15, 15) / 15,
+      
+      // Candle ratios are already [0,1]
       features.bodyRatio,
       features.upperWickRatio,
       features.lowerWickRatio,
-      features.sma_3,
-      features.sma_5,
-      features.sma_13,
-      features.ema_3,
-      features.ema_5,
-      features.ema_13,
-      features.rsi_14,
-      features.atr_14,
-      features.hour / 24, // Normalize
-      features.minute / 60, // Normalize
-      features.dayOfWeek / 7, // Normalize
+      
+      // Normalize moving averages relative to current price
+      (features.sma_3 - latest) / latest,
+      (features.sma_5 - latest) / latest,
+      (features.sma_13 - latest) / latest,
+      (features.ema_3 - latest) / latest,
+      (features.ema_5 - latest) / latest,
+      (features.ema_13 - latest) / latest,
+      
+      // RSI normalized to [-1, 1]
+      (features.rsi_14 - 50) / 50,
+      
+      // ATR normalized relative to price
+      features.atr_14 / latest,
+      
+      // Time features normalized
+      features.hour / 24,
+      features.minute / 60,
+      features.dayOfWeek / 7,
     ];
+  }
+  
+  private clamp(value: number, min: number, max: number): number {
+    return Math.max(min, Math.min(max, value));
   }
 }
 
