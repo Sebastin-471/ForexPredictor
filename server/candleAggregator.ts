@@ -2,7 +2,7 @@ import { storage } from "./storage";
 import { EventEmitter } from "events";
 import { type Candle, type Tick } from "@shared/schema";
 
-const CANDLE_INTERVAL_MS = 5000; // 5 seconds for fast testing (change to 60000 for 1-minute candles)
+const CANDLE_INTERVAL_MS = 60000; // 1 minute candles
 
 export class CandleAggregator extends EventEmitter {
   private currentCandle: {
