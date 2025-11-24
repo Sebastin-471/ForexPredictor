@@ -10,7 +10,7 @@ import ControlPanel from "@/components/ControlPanel";
 import ThemeToggle from "@/components/ThemeToggle";
 import { Activity, Target, Zap } from "lucide-react";
 import { wsClient } from "@/lib/websocket";
-import { type Signal } from "@shared/schema";
+import { type Signal, type Candle } from "@shared/schema";
 
 interface MetricsData {
   accuracy: number;
@@ -31,6 +31,7 @@ export default function Dashboard() {
   const [lastUpdate, setLastUpdate] = useState("2s ago");
   const [signals, setSignals] = useState<Signal[]>([]);
   const [latestSignal, setLatestSignal] = useState<Signal | null>(null);
+  const [candles, setCandles] = useState<Candle[]>([]);
   const [metrics, setMetrics] = useState<MetricsData>({
     accuracy: 0.673,
     precision: 0.71,
@@ -73,6 +74,25 @@ export default function Dashboard() {
         const latestTick = data.ticks[0];
         setCurrentPrice(latestTick.mid);
       }
+
+      if (data.candles && data.candles.length > 0) {
+        setCandles(data.candles);
+      }
+    });
+
+    // Candle update listener
+    wsClient.on("candle_update", (candle: Candle) => {
+      setCandles((prev) => {
+        const existingIndex = prev.findIndex(
+          (c) => new Date(c.timestamp).getTime() === new Date(candle.timestamp).getTime()
+        );
+        if (existingIndex >= 0) {
+          const updated = [...prev];
+          updated[existingIndex] = candle;
+          return updated;
+        }
+        return [...prev, candle].slice(-50);
+      });
     });
 
     // Tick listener
@@ -205,7 +225,7 @@ export default function Dashboard() {
           </div>
 
           <div className="lg:col-span-6 space-y-6">
-            <TradingChart height="500px" />
+            <TradingChart candles={candles} signals={signals} height="500px" />
             
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <MetricCard 
