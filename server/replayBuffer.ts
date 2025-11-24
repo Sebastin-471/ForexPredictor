@@ -1,4 +1,5 @@
 export interface TrainingExample {
+  id: string;
   features: number[];
   label: number | null; // 1 = UP, 0 = DOWN, null = pending
   createdAt: number;
@@ -27,6 +28,10 @@ export class ReplayBuffer {
   peekLast(): TrainingExample | null {
     if (this.buffer.length === 0) return null;
     return this.buffer[this.buffer.length - 1];
+  }
+
+  findById(id: string): TrainingExample | null {
+    return this.buffer.find(sample => sample.id === id) || null;
   }
 
   sampleWithLabels(n: number): TrainingExample[] {

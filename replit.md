@@ -42,26 +42,40 @@ Preferred communication style: Simple, everyday language.
 2. **Candle Aggregator** (`server/candleAggregator.ts`): Consumes tick data and aggregates into 1-minute OHLCV candles. Emits events when candles close to trigger prediction generation.
 
 3. **Feature Engine** (`server/featureEngine.ts`): Calculates technical indicators from candle data including:
-   - Returns (1m, 2m, 5m, 10m)
-   - Moving averages (SMA, EMA with periods 3, 5, 13)
-   - RSI (14-period)
-   - ATR (14-period)
+   - Returns (1m, 2m, 5m, 10m) - normalized and clamped
+   - Moving averages (SMA, EMA with periods 3, 5, 13) - normalized relative to current price
+   - RSI (14-period) - normalized to [-1, 1]
+   - ATR (14-period) - normalized relative to price
    - Candle body/wick ratios
    - Time-based features (hour, minute, day of week)
+   - All features are normalized to improve neural network training
 
-4. **ML Model** (`server/mlModel.ts`): Simple logistic regression-like model with sigmoid activation. Implements online learning - updates weights after each prediction result using gradient descent. Maintains rolling buffer of recent training examples (500 max).
+4. **Replay Buffer** (`server/replayBuffer.ts`): Experience replay system for training stability:
+   - Stores up to 50,000 training examples (features + labels)
+   - Supports random sampling for batch training
+   - Labels are set when actual price movement is known (after 1 minute)
 
-5. **Prediction Engine** (`server/predictionEngine.ts`): Orchestrates the prediction pipeline:
-   - Triggers every minute to generate new prediction
-   - Fetches recent candles, calculates features, runs ML inference
-   - Stores pending predictions and validates them against actual outcomes
-   - Triggers model retraining every 50 predictions
-   - Emits signals via WebSocket to frontend
+5. **TensorFlow.js Model** (`server/tfModel.ts`): Deep neural network with 3 hidden layers:
+   - Architecture: 18 inputs → 64 neurons (ReLU + Dropout 30%) → 32 neurons (ReLU + Dropout 20%) → 16 neurons (ReLU) → 1 output (Sigmoid)
+   - Total: 3,841 trainable parameters
+   - L2 regularization to prevent overfitting
+   - Adam optimizer with learning rate 0.001
+   - Binary cross-entropy loss for UP/DOWN classification
+
+6. **Prediction Engine** (`server/predictionEngine.ts`): Orchestrates the prediction and training pipeline:
+   - Generates predictions every minute using TensorFlow model
+   - Stores predictions in replay buffer with null labels (pending)
+   - Validates predictions after 1 minute and labels training samples
+   - Background training loop every 10 seconds with batch size 64
+   - Continuous online learning from market outcomes
+   - Emits signals and metrics via WebSocket to frontend
 
 **Data Flow**:
 ```
-TickSimulator → CandleAggregator → FeatureEngine → MLModel → PredictionEngine → WebSocket → Frontend
-                                                                      ↓
+TickSimulator → CandleAggregator → FeatureEngine → TFModel → PredictionEngine → WebSocket → Frontend
+                                                                      ↓              ↑
+                                                               ReplayBuffer ←────────┘
+                                                                      ↓         (training)
                                                               Storage (in-memory/DB)
 ```
 
@@ -102,22 +116,35 @@ TickSimulator → CandleAggregator → FeatureEngine → MLModel → PredictionE
 
 ### Machine Learning Strategy
 
-**Model Type**: Online learning logistic regression with sigmoid activation. Simple but effective for binary classification (UP/DOWN).
+**Model Type**: Deep neural network using TensorFlow.js (`@tensorflow/tfjs-node`) for enhanced prediction accuracy.
+
+**Architecture**:
+- **Input Layer**: 18 normalized features (price returns, technical indicators, time features)
+- **Hidden Layer 1**: 64 neurons with ReLU activation + 30% dropout (He initialization, L2 regularization)
+- **Hidden Layer 2**: 32 neurons with ReLU activation + 20% dropout (He initialization, L2 regularization)
+- **Hidden Layer 3**: 16 neurons with ReLU activation (He initialization)
+- **Output Layer**: 1 neuron with sigmoid activation (binary classification: UP/DOWN)
+- **Total Parameters**: 3,841 trainable parameters
 
 **Training Strategy**:
-- **Initial State**: Random small weights initialization
-- **Online Learning**: After each minute, actual price movement validates the prediction, and the model updates weights via gradient descent
-- **Batch Retraining**: Every 50 predictions triggers more intensive weight updates
-- **Feature Scaling**: Implicit normalization through returns-based features
+- **Initial State**: Random weight initialization using He Normal and Glorot Normal
+- **Experience Replay**: Stores up to 50,000 training examples in replay buffer
+- **Online Learning**: After each prediction, actual price movement labels the training sample
+- **Batch Training**: Every 10 seconds, samples 64 random examples from buffer and trains for 5 epochs
+- **Optimizer**: Adam with learning rate 0.001
+- **Loss Function**: Binary cross-entropy
+- **Feature Normalization**: All features scaled to [-1, 1] or [0, 1] for optimal neural network training
 
 **Performance Tracking**: 
+- Real-time accuracy and loss metrics during training
 - Dynamic success rate using time-weighted accuracy
 - Precision and recall for imbalanced class detection
-- Rolling window metrics (last N signals)
+- Rolling window metrics (last 100 signals)
+- Model version tracking for each prediction
 
-**Auto-Learning Mechanism**: Continuously improves by learning from prediction errors. Maintains buffer of recent examples to avoid catastrophic forgetting while adapting to market regime changes.
+**Auto-Learning Mechanism**: Continuously improves through experience replay and batch training. The replay buffer prevents catastrophic forgetting by maintaining a diverse set of historical examples. The model adapts to changing market conditions while retaining knowledge from past patterns.
 
-**Rationale**: A lightweight model enables real-time inference and training without GPU requirements. The online learning approach allows the system to adapt to changing market conditions without manual retraining cycles.
+**Rationale**: Deep learning provides superior pattern recognition compared to simple logistic regression. The 3-layer architecture can learn complex non-linear relationships in price movements. TensorFlow.js enables efficient CPU-based training without requiring GPU infrastructure. Experience replay ensures stable training and prevents overfitting to recent data.
 
 ## External Dependencies
 
