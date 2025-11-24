@@ -1,0 +1,1023 @@
+// ==== BACKEND MVP (Node.js + Express + TensorFlow.js) ====
+// File: backend.js
+
+const express = require('express');
+const tf = require('@tensorflow/tfjs-node');
+
+const app = express();
+let model;
+
+async function createModel() {
+  model = tf.sequential();
+  model.add(tf.layers.dense({ units: 16, activation: 'relu', inputShape: [4] }));
+  model.add(tf.layers.dense({ units: 8, activation: 'relu' }));
+  model.add(tf.layers.dense({ units: 1, activation: 'tanh' }));
+  model.compile({ optimizer: 'adam', loss: 'mse' });
+}
+createModel();
+
+app.get('/predict', async (req, res) => {
+  const { o, h, l, c } = req.query;
+  const input = tf.tensor2d([[+o, +h, +l, +c]]);
+  const pred = model.predict(input).dataSync()[0];
+  res.json({ prediction: pred > 0 ? 'UP' : 'DOWN', raw: pred });
+});
+
+app.listen(3001, () => console.log('Backend running on 3001'));
+
+// ==== FRONTEND REACT (Minimalista tipo trae.ai) ====
+// File: Predictor.jsx
+
+import React, { useState } from 'react';
+
+export default function Predictor() {
+  const [data, setData] = useState({ o: '', h: '', l: '', c: '' });
+  const [result, setResult] = useState(null);
+
+  const predict = async () => {
+    const q = new URLSearchParams(data).toString();
+    const r = await fetch(`http://localhost:3001/predict?${q}`);
+    const json = await r.json();
+    setResult(json);
+  };
+
+  return (
+    <div className="p-6 max-w-md mx-auto bg-neutral-900 text-white rounded-2xl shadow-xl space-y-4">
+      <h1 className="text-2xl font-bold text-center">Predictor EUR/USD 1M</h1>
+      <input className="w-full p-2 rounded bg-neutral-800" placeholder="Open" onChange={e=>setData({...data,o:e.target.value})}/>
+      <input className="w-full p-2 rounded bg-neutral-800" placeholder="High" onChange={e=>setData({...data,h:e.target.value})}/>
+      <input className="w-full p-2 rounded bg-neutral-800" placeholder="Low" onChange={e=>setData({...data,l:e.target.value})}/>
+      <input className="w-full p-2 rounded bg-neutral-800" placeholder="Close" onChange={e=>setData({...data,c:e.target.value})}/>
+      <button className="w-full p-2 bg-blue-600 rounded-xl" onClick={predict}>Predecir</button>
+      {result && (
+        <div className="text-center text-xl font-semibold">
+          Señal: {result.prediction} (raw: {result.raw.toFixed(4)})
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Proyecto: Predictor EUR/USD 1m — Backend + Frontend + IA Autoaprendiz (MVP)
+// --------------------------------------------------------------
+// Estructura incluída en este único documento para copiar/pegar en archivos separados:
+//  - backend/server.js         (Node.js + Express + ws + @tensorflow/tfjs-node)
+//  - backend/replayBuffer.js   (clase simple de replay buffer)
+//  - backend/model.js          (construcción, inferencia y actualización online)
+//  - frontend/src/App.jsx      (React + Tailwind + recharts)
+//  - frontend/src/wsClient.js  (cliente websocket utilitario)
+//  - README (instrucciones cortas para levantar el MVP)
+
+/* -----------------------------------------------------------------
+  backend/server.js
+  - endpoints:
+    POST /tick       -> recibir tick OHLCV (desde proveedor de datos o simulador)
+    GET  /predict    -> predict synchronous (para testing)
+    GET  /metrics    -> metrics actuales (accuracy, trades, etc.)
+  - WebSocket /ws   -> stream en tiempo real: { tick, prediction, accuracy }
+  - Loop de entrenamiento online: entrena en batches desde replay buffer cada N segundos
+------------------------------------------------------------------*/
+
+// backend/server.js
+const express = require('express');
+const bodyParser = require('body-parser');
+const http = require('http');
+const WebSocket = require('ws');
+const tf = require('@tensorflow/tfjs-node');
+const ReplayBuffer = require('./replayBuffer');
+const ModelManager = require('./model');
+
+const app = express();
+app.use(bodyParser.json());
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: '/ws' });
+
+// Config
+const PORT = process.env.PORT || 3001;
+const TRAIN_INTERVAL_MS = 5000; // cada 5s intenta entrenar en background
+const BATCH_SIZE = 64;
+
+// Estado global simple
+const buffer = new ReplayBuffer(50000);
+const modelManager = new ModelManager({ inputSize: 8 }); // features: OHLC + normalized returns + indicators
+let metrics = { totalTicks: 0, predictions: 0, correct: 0, accuracy: 0 };
+
+// Util helper: feature extraction (simple)
+function extractFeatures(lastTicks) {
+  // lastTicks: array de objetos { o,h,l,c,volume,ts }
+  // Generamos features simples: normalized OHLC del último tick, log returns de 1/2/3 barras, simple SMA diff
+  const last = lastTicks[lastTicks.length - 1];
+  const o = last.o, h = last.h, l = last.l, c = last.c;
+  const range = h - l || 1e-6;
+  const normO = (o - c) / range;
+  const normH = (h - c) / range;
+  const normL = (l - c) / range;
+  const normC = 0; // always zero-centered on close
+
+  // returns
+  function ret(i) {
+    if (lastTicks.length - 1 - i < 0) return 0;
+    const prev = lastTicks[lastTicks.length - 1 - i].c;
+    return Math.log((c + 1e-8) / (prev + 1e-8));
+  }
+
+  const r1 = ret(1);
+  const r2 = ret(2);
+  const smaFast = lastTicks.slice(-5).reduce((s,x)=>s+x.c,0)/Math.max(1, Math.min(5,lastTicks.length));
+  const smaSlow = lastTicks.slice(-20).reduce((s,x)=>s+x.c,0)/Math.max(1, Math.min(20,lastTicks.length));
+  const smaDiff = smaFast - smaSlow;
+
+  return [normO, normH, normL, normC, r1, r2, smaDiff, (c / (smaSlow||1))-1];
+}
+
+// Almacenamos ticks en memoria circular simple (para features histórico)
+const tickWindow = [];
+const MAX_WINDOW = 50;
+
+// WebSocket broadcasting
+function broadcast(data) {
+  const s = JSON.stringify(data);
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) client.send(s);
+  });
+}
+
+// Endpoints
+app.post('/tick', async (req, res) => {
+  // Expected body: { o,h,l,c,volume,ts }
+  const tick = req.body;
+  if (!tick || typeof tick.c === 'undefined') return res.status(400).send({ error: 'Invalid tick' });
+
+  tickWindow.push(tick);
+  if (tickWindow.length > MAX_WINDOW) tickWindow.shift();
+
+  metrics.totalTicks += 1;
+
+  // Create feature vector
+  const features = extractFeatures(tickWindow);
+
+  // Make prediction
+  const predRaw = await modelManager.predictRaw(features);
+  const predLabel = predRaw > 0 ? 1 : 0; // 1 = up next bar, 0 = down
+
+  // For supervised signal: we don't yet know the next bar. So we store sample in replay buffer
+  // We'll label it later when next tick arrives — simple technique: when next tick arrives we mark previous sample outcome.
+
+  // Append sample with 'pending' label
+  buffer.add({ features, label: null, createdAt: Date.now() });
+
+  // Send immediate data to frontend
+  broadcast({ type: 'tick', tick, prediction: { raw: predRaw, label: predLabel }, metrics });
+
+  res.send({ ok: true, prediction: predLabel, raw: predRaw });
+});
+
+// To finalize previous sample when we know next bar's close: POST /tick/label
+// But simpler: when a new tick arrives, we set the label for the previous buffer entry based on price move.
+app.post('/tick/finalize', (req, res) => {
+  // body: { prevClose }
+  const { prevClose } = req.body;
+  // This endpoint kept for compatibility; in practice server assigns labels on arrival of next tick.
+  res.send({ ok: true });
+});
+
+app.get('/predict', async (req, res) => {
+  // quick test predictor: accepts ?o=..&h=..&l=..&c=..
+  const { o,h,l,c } = req.query;
+  if (typeof c === 'undefined') return res.status(400).send({ error: 'missing c' });
+  const tick = { o:+o, h:+h, l:+l, c:+c };
+  tickWindow.push(tick);
+  if (tickWindow.length > MAX_WINDOW) tickWindow.shift();
+  const features = extractFeatures(tickWindow);
+  const predRaw = await modelManager.predictRaw(features);
+  res.send({ raw: predRaw, label: predRaw>0? 'UP':'DOWN' });
+});
+
+app.get('/metrics', (req,res)=>{
+  metrics.accuracy = metrics.predictions ? (metrics.correct / metrics.predictions) : 0;
+  res.send(metrics);
+});
+
+// WebSocket connection: send initial metrics
+wss.on('connection', (ws)=>{
+  ws.send(JSON.stringify({ type: 'metrics', metrics }));
+});
+
+// Background: when a new tick arrives we want to label the last sample
+// We'll wrap server to detect price moves via a small hook: whenever tickWindow gets a new item, set label of previous sample.
+function labelPreviousSample() {
+  // If buffer latest item has null label, set based on last two closes
+  if (buffer.size()===0) return;
+  const lastSample = buffer.peekLast();
+  if (!lastSample || lastSample.label !== null) return;
+  // Need at least 2 ticks
+  if (tickWindow.length < 2) return;
+  const prev = tickWindow[tickWindow.length-2].c;
+  const curr = tickWindow[tickWindow.length-1].c;
+  const label = (curr > prev) ? 1 : 0;
+  lastSample.label = label;
+}
+
+// Monkey-patch buffer.add to label previous sample when next tick appears
+// (We'll instead call labelPreviousSample after each /tick POST; so modify server POST above to call it)
+
+// TRAINING LOOP
+let training = false;
+async function trainingLoop() {
+  if (training) return; // avoid overlapping
+  training = true;
+  try {
+    const batch = buffer.sampleWithLabels(BATCH_SIZE);
+    if (batch && batch.length >= Math.min(16, BATCH_SIZE)) {
+      const xs = batch.map(b=>b.features);
+      const ys = batch.map(b=>b.label);
+      await modelManager.trainOnBatch(xs, ys);
+      console.log(`Trained on batch ${batch.length}`);
+    }
+  } catch (e) {
+    console.error('training loop error', e);
+  }
+  training = false;
+}
+
+setInterval(trainingLoop, TRAIN_INTERVAL_MS);
+
+// When a tick arrives we need to label previous sample: update the /tick handler to call labelPreviousSample
+// We'll rebind express route to include labeling logic: (replace earlier route) — simpler: intercept POST body parser
+
+// To keep code cohesive, override the /tick route defined earlier with more logic:
+app._router.stack = app._router.stack.filter(r => !(r.route && r.route.path === '/tick'));
+app.post('/tick', async (req, res) => {
+  const tick = req.body;
+  if (!tick || typeof tick.c === 'undefined') return res.status(400).send({ error: 'Invalid tick' });
+  // label previous sample
+  tickWindow.push(tick);
+  if (tickWindow.length > MAX_WINDOW) tickWindow.shift();
+
+  // Label previous sample
+  if (buffer.size() > 0) {
+    const last = buffer.peekLast();
+    if (last && last.label === null && tickWindow.length >= 2) {
+      const prevClose = tickWindow[tickWindow.length-2].c;
+      const currClose = tickWindow[tickWindow.length-1].c;
+      last.label = (currClose > prevClose) ? 1 : 0;
+      // update metrics if model had predicted for that sample before
+      // We'll simulate that previous prediction was performed when sample was added — in production we'd store pred too
+    }
+  }
+
+  metrics.totalTicks += 1;
+  const features = extractFeatures(tickWindow);
+  const predRaw = await modelManager.predictRaw(features);
+  const predLabel = predRaw > 0 ? 1 : 0;
+
+  // Add new pending sample
+  buffer.add({ features, label: null, createdAt: Date.now() });
+
+  // Update metrics: optional simulated evaluation (requires historical predictions)
+  // Broadcast
+  broadcast({ type: 'tick', tick, prediction: { raw: predRaw, label: predLabel }, metrics });
+  res.send({ ok: true });
+});
+
+// Start server
+server.listen(PORT, ()=> console.log(`Server listening on ${PORT}`));
+
+/* -----------------------------------------------------------------
+  backend/replayBuffer.js
+  - Simple in-memory replay buffer with ability to sample only labeled items
+------------------------------------------------------------------*/
+
+// backend/replayBuffer.js
+class ReplayBuffer {
+  constructor(maxSize=10000){
+    this.maxSize = maxSize;
+    this.buffer = [];
+  }
+  add(sample){
+    this.buffer.push(sample);
+    if (this.buffer.length > this.maxSize) this.buffer.shift();
+  }
+  size(){ return this.buffer.length; }
+  peekLast(){ return this.buffer[this.buffer.length-1]; }
+  sampleWithLabels(n){
+    const labeled = this.buffer.filter(b => b.label === 0 || b.label === 1);
+    if (labeled.length === 0) return [];
+    const out = [];
+    for (let i=0;i<Math.min(n,labeled.length);i++){
+      const idx = Math.floor(Math.random() * labeled.length);
+      out.push(labeled[idx]);
+    }
+    return out;
+  }
+}
+module.exports = ReplayBuffer;
+
+/* -----------------------------------------------------------------
+  backend/model.js
+  - Gestor del modelo: construcción del modelo baseline, inferencia y entrenamiento incremental
+  - Usamos TensorFlow.js (node) para poder exportar/guardar pesos
+------------------------------------------------------------------*/
+
+// backend/model.js
+const tfnode = require('@tensorflow/tfjs-node');
+
+class ModelManager {
+  constructor(opts = {}){
+    this.inputSize = opts.inputSize || 8;
+    this.model = this.buildModel();
+    this.optimizer = tfnode.train.adam(0.001);
+    this.model.compile({ optimizer: this.optimizer, loss: 'binaryCrossentropy', metrics: ['accuracy'] });
+  }
+  buildModel(){
+    const m = tfnode.sequential();
+    m.add(tfnode.layers.dense({ units: 64, activation: 'relu', inputShape: [this.inputSize] }));
+    m.add(tfnode.layers.dropout({ rate: 0.15 }));
+    m.add(tfnode.layers.dense({ units: 32, activation: 'relu' }));
+    m.add(tfnode.layers.dense({ units: 1, activation: 'tanh' })); // tanh -> [-1,1]
+    return m;
+  }
+  async predictRaw(features){
+    // features: array length inputSize
+    try{
+      const x = tfnode.tensor2d([features]);
+      const out = this.model.predict(x);
+      const val = (await out.data())[0];
+      x.dispose(); out.dispose();
+      return val; // in [-1,1]
+    }catch(e){
+      console.error('predict error', e);
+      return 0;
+    }
+  }
+  async trainOnBatch(xs, ys){
+    // xs: array of feature arrays, ys: array of labels 0 or 1
+    const xT = tfnode.tensor2d(xs);
+    // convert labels to -1/1 to match tanh? We'll map 0->-1,1->1 and use mse
+    const yMapped = ys.map(v => v === 1 ? 1 : -1);
+    const yT = tfnode.tensor2d(yMapped, [yMapped.length,1]);
+    // Use meanSquaredError to match tanh output
+    await this.model.fit(xT, yT, { epochs: 4, batchSize: Math.min(64, xs.length), verbose: 0 });
+    xT.dispose(); yT.dispose();
+  }
+  async save(path){ await this.model.save(path); }
+}
+module.exports = ModelManager;
+
+/* -----------------------------------------------------------------
+  frontend/src/App.jsx
+  - React dashboard minimalista
+  - Usa WebSocket para recibir ticks y predicciones en tiempo real
+  - Muestra: gráfico de precios (últimos N), señal actual, accuracy dinámico
+  - Librerías sugeridas: recharts, tailwind
+------------------------------------------------------------------*/
+
+// frontend/src/App.jsx
+import React, { useEffect, useState, useRef } from 'react';
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
+import useWebsocket from './wsClient';
+
+export default function App(){
+  const [ticks, setTicks] = useState([]);
+  const [prediction, setPrediction] = useState(null);
+  const [metrics, setMetrics] = useState({ accuracy: 0 });
+  const ws = useWebsocket('ws://localhost:3001/ws');
+
+  useEffect(()=>{
+    if (!ws) return;
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'tick'){
+        setTicks(prev => {
+          const next = [...prev, { ts: msg.tick.ts || Date.now(), c: msg.tick.c }].slice(-200);
+          return next;
+        });
+        if (msg.prediction) setPrediction(msg.prediction);
+        if (msg.metrics) setMetrics(msg.metrics);
+      }
+      if (msg.type === 'metrics') setMetrics(msg.metrics);
+    };
+  },[ws]);
+
+  return (
+    <div className="min-h-screen bg-neutral-900 text-white p-6">
+      <div className="max-w-4xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div className="col-span-2 bg-neutral-800 p-4 rounded-2xl shadow-lg">
+          <h2 className="text-lg font-semibold mb-2">EUR/USD — Últimos 200 ticks (1m)</h2>
+          <div style={{ width: '100%', height: 320 }}>
+            <ResponsiveContainer>
+              <LineChart data={ticks}>
+                <XAxis dataKey="ts" tickFormatter={(t)=>new Date(t).toLocaleTimeString()} />
+                <YAxis domain={[dataMin=>dataMin*0.999, dataMax=>dataMax*1.001]} />
+                <Tooltip labelFormatter={(t)=>new Date(t).toLocaleTimeString()} />
+                <Line type="monotone" dataKey="c" strokeWidth={2} dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+
+        <div className="bg-neutral-800 p-4 rounded-2xl shadow-lg space-y-4">
+          <h2 className="text-lg font-semibold">Señal actual</h2>
+          <div className="text-center">
+            <div className="text-5xl font-bold">{prediction ? (prediction.raw>0? '↑ UP':'↓ DOWN') : '—'}</div>
+            <div className="text-sm mt-1">Raw: {prediction ? prediction.raw.toFixed(4) : '—'}</div>
+          </div>
+
+          <div className="pt-4">
+            <h3 className="text-sm">Precisión dinámica</h3>
+            <div className="text-3xl font-semibold">{(metrics.accuracy*100).toFixed(2)}%</div>
+            <div className="text-xs text-neutral-400">Ticks procesados: {metrics.totalTicks || 0}</div>
+          </div>
+
+          <div className="pt-4">
+            <button className="w-full bg-blue-600 py-2 rounded-xl">Forzar retrain</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* -----------------------------------------------------------------
+  frontend/src/wsClient.js
+  - simple hook that returns a WebSocket instance and handles reconnects
+------------------------------------------------------------------*/
+
+// frontend/src/wsClient.js
+import { useEffect, useRef, useState } from 'react';
+
+export default function useWebsocket(url){
+  const wsRef = useRef(null);
+  const [socket, setSocket] = useState(null);
+
+  useEffect(()=>{
+    let cont = true;
+    function connect(){
+      const s = new WebSocket(url);
+      s.onopen = ()=>console.log('ws open');
+      s.onclose = ()=>{ console.log('ws closed'); if (cont) setTimeout(connect, 2000); };
+      s.onerror = (e)=>console.error('ws err', e);
+      wsRef.current = s;
+      setSocket(s);
+    }
+    connect();
+    return ()=>{ cont=false; if (wsRef.current) wsRef.current.close(); };
+  },[url]);
+
+  return socket;
+}
+
+/* -----------------------------------------------------------------
+  README (suma de instrucciones)
+------------------------------------------------------------------*/
+
+// README — Cómo levantar el MVP local
+
+// 1) Backend
+// - Crear carpeta backend y copiar: server.js, replayBuffer.js, model.js
+// - npm init -y
+// - npm install express body-parser ws @tensorflow/tfjs-node
+// - node server.js
+
+// 2) Frontend
+// - Crear app React (Vite o CRA)
+// - Instalar recharts y tailwind
+// - Copiar App.jsx y wsClient.js
+// - npm run dev
+
+// Notas importantes y siguientes pasos:
+// - Actualmente el labeling es "next-close > prev-close" (binario). Puedes mejorar con thresholds, ignore small moves, etc.
+// - Para producción: usar persistencia (redis/kafka), asegurar orden de ticks, proteger websocket con auth y CORS
+// - Para IA: mejorar features (orderflow, ticks por segundo, vol, microstructure), añadir ensembles, calibración de probabilidad
+// - Métricas: backtest separado con slippage, comisiones y gestión de riesgo antes de operar en real.
+
+// Si quieres que lo despliegue en archivos separados, o que genere un notebook de backtest con datos históricos (CSV) y gráficos, lo hago ahora mismo y te lo dejo listo para ejecutar.
+
+
+// FULL PROJECT — Files ready to copy/paste
+// ------------------------------------------------------------
+// This single file contains many separated file contents. Copy each section into its own file.
+// Sections:
+// 1) backend/package.json
+// 2) backend/server.js
+// 3) backend/replayBuffer.js
+// 4) backend/model.js
+// 5) backend/.env.example
+// 6) frontend/package.json (Vite React)
+// 7) frontend/src/main.jsx
+// 8) frontend/src/App.jsx
+// 9) frontend/src/wsClient.js
+// 10) frontend/index.html
+// 11) frontend/tailwind.config.cjs + postcss.config.cjs
+// 12) backtest/backtest_notebook.py (standalone python script / notebook)
+// 13) scripts/simulate_ticks.js (simulador de ticks para desarrollo)
+// 14) README_FULL.md
+
+/* ===================================================================
+  1) backend/package.json
+=================================================================== */
+{
+  "name": "eurusd-predictor-backend",
+  "version": "0.1.0",
+  "main": "server.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs-node": "^5.0.0",
+    "body-parser": "^1.20.2",
+    "express": "^4.18.2",
+    "ws": "^8.13.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
+  }
+}
+
+/* ===================================================================
+  2) backend/server.js
+=================================================================== */
+// Copy into backend/server.js
+const express = require('express');
+const bodyParser = require('body-parser');
+const http = require('http');
+const WebSocket = require('ws');
+const tf = require('@tensorflow/tfjs-node');
+const ReplayBuffer = require('./replayBuffer');
+const ModelManager = require('./model');
+require('dotenv').config();
+
+const app = express();
+app.use(bodyParser.json());
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: '/ws' });
+
+const PORT = process.env.PORT || 3001;
+const TRAIN_INTERVAL_MS = Number(process.env.TRAIN_INTERVAL_MS || 5000);
+const BATCH_SIZE = Number(process.env.BATCH_SIZE || 64);
+
+const buffer = new ReplayBuffer(100000);
+const modelManager = new ModelManager({ inputSize: 8 });
+let metrics = { totalTicks: 0, predictions: 0, correct: 0, accuracy: 0 };
+
+const tickWindow = [];
+const MAX_WINDOW = 50;
+
+function extractFeatures(lastTicks) {
+  const last = lastTicks[lastTicks.length - 1];
+  const o = last.o, h = last.h, l = last.l, c = last.c;
+  const range = Math.max(h - l, 1e-8);
+  const normO = (o - c) / range;
+  const normH = (h - c) / range;
+  const normL = (l - c) / range;
+  const normC = 0;
+  function ret(i) {
+    if (lastTicks.length - 1 - i < 0) return 0;
+    const prev = lastTicks[lastTicks.length - 1 - i].c;
+    return Math.log((c + 1e-8) / (prev + 1e-8));
+  }
+  const r1 = ret(1);
+  const r2 = ret(2);
+  const smaFast = lastTicks.slice(-5).reduce((s,x)=>s+x.c,0)/Math.max(1, Math.min(5,lastTicks.length));
+  const smaSlow = lastTicks.slice(-20).reduce((s,x)=>s+x.c,0)/Math.max(1, Math.min(20,lastTicks.length));
+  const smaDiff = smaFast - smaSlow;
+  return [normO, normH, normL, normC, r1, r2, smaDiff, (c / (smaSlow||1))-1];
+}
+
+function broadcast(data) {
+  const s = JSON.stringify(data);
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) client.send(s);
+  });
+}
+
+app.post('/tick', async (req, res) => {
+  const tick = req.body;
+  if (!tick || typeof tick.c === 'undefined') return res.status(400).send({ error: 'Invalid tick' });
+
+  tickWindow.push(tick);
+  if (tickWindow.length > MAX_WINDOW) tickWindow.shift();
+
+  // Label previous sample if pending
+  if (buffer.size() > 0) {
+    const last = buffer.peekLast();
+    if (last && last.label === null && tickWindow.length >= 2) {
+      const prevClose = tickWindow[tickWindow.length-2].c;
+      const currClose = tickWindow[tickWindow.length-1].c;
+      last.label = (currClose > prevClose) ? 1 : 0;
+      // update metrics if needed
+    }
+  }
+
+  metrics.totalTicks += 1;
+
+  const features = extractFeatures(tickWindow);
+  const predRaw = await modelManager.predictRaw(features);
+  const predLabel = predRaw > 0 ? 1 : 0;
+
+  buffer.add({ features, label: null, createdAt: Date.now(), pred: predLabel });
+
+  broadcast({ type: 'tick', tick, prediction: { raw: predRaw, label: predLabel }, metrics });
+
+  res.send({ ok: true });
+});
+
+app.get('/predict', async (req, res) => {
+  const { o,h,l,c } = req.query;
+  if (typeof c === 'undefined') return res.status(400).send({ error: 'missing c' });
+  const tick = { o:+o, h:+h, l:+l, c:+c };
+  tickWindow.push(tick);
+  if (tickWindow.length > MAX_WINDOW) tickWindow.shift();
+  const features = extractFeatures(tickWindow);
+  const predRaw = await modelManager.predictRaw(features);
+  res.send({ raw: predRaw, label: predRaw>0? 'UP':'DOWN' });
+});
+
+app.get('/metrics', (req,res)=>{
+  metrics.accuracy = metrics.predictions ? (metrics.correct / metrics.predictions) : 0;
+  res.send(metrics);
+});
+
+wss.on('connection', (ws)=>{
+  ws.send(JSON.stringify({ type: 'metrics', metrics }));
+});
+
+async function trainingLoop() {
+  try {
+    const batch = buffer.sampleWithLabels(BATCH_SIZE);
+    if (batch && batch.length >= Math.min(16, BATCH_SIZE)) {
+      const xs = batch.map(b=>b.features);
+      const ys = batch.map(b=>b.label);
+      await modelManager.trainOnBatch(xs, ys);
+      console.log(`Trained on batch ${batch.length}`);
+    }
+  } catch (e) { console.error('training error', e); }
+}
+setInterval(trainingLoop, TRAIN_INTERVAL_MS);
+
+server.listen(PORT, ()=> console.log(`Server listening on ${PORT}`));
+
+/* ===================================================================
+  3) backend/replayBuffer.js
+=================================================================== */
+// Copy into backend/replayBuffer.js
+class ReplayBuffer {
+  constructor(maxSize=10000){
+    this.maxSize = maxSize;
+    this.buffer = [];
+  }
+  add(sample){
+    this.buffer.push(sample);
+    if (this.buffer.length > this.maxSize) this.buffer.shift();
+  }
+  size(){ return this.buffer.length; }
+  peekLast(){ return this.buffer[this.buffer.length-1]; }
+  sampleWithLabels(n){
+    const labeled = this.buffer.filter(b => b.label === 0 || b.label === 1);
+    if (labeled.length === 0) return [];
+    const out = [];
+    for (let i=0;i<Math.min(n,labeled.length);i++){
+      const idx = Math.floor(Math.random() * labeled.length);
+      out.push(labeled[idx]);
+    }
+    return out;
+  }
+}
+module.exports = ReplayBuffer;
+
+/* ===================================================================
+  4) backend/model.js
+=================================================================== */
+// Copy into backend/model.js
+const tfnode = require('@tensorflow/tfjs-node');
+
+class ModelManager {
+  constructor(opts = {}){
+    this.inputSize = opts.inputSize || 8;
+    this.model = this.buildModel();
+    this.model.compile({ optimizer: tfnode.train.adam(0.001), loss: 'meanSquaredError' });
+  }
+  buildModel(){
+    const m = tfnode.sequential();
+    m.add(tfnode.layers.dense({ units: 64, activation: 'relu', inputShape: [this.inputSize] }));
+    m.add(tfnode.layers.dropout({ rate: 0.12 }));
+    m.add(tfnode.layers.dense({ units: 32, activation: 'relu' }));
+    m.add(tfnode.layers.dense({ units: 1, activation: 'tanh' }));
+    return m;
+  }
+  async predictRaw(features){
+    try{
+      const x = tfnode.tensor2d([features]);
+      const out = this.model.predict(x);
+      const val = (await out.data())[0];
+      x.dispose(); out.dispose();
+      return val;
+    }catch(e){ console.error('predict err', e); return 0; }
+  }
+  async trainOnBatch(xs, ys){
+    const xT = tfnode.tensor2d(xs);
+    const yMapped = ys.map(v => v === 1 ? 1 : -1);
+    const yT = tfnode.tensor2d(yMapped, [yMapped.length,1]);
+    await this.model.fit(xT, yT, { epochs: 4, batchSize: Math.min(64, xs.length), verbose: 0 });
+    xT.dispose(); yT.dispose();
+  }
+  async save(path){ await this.model.save(path); }
+}
+module.exports = ModelManager;
+
+/* ===================================================================
+  5) backend/.env.example
+=================================================================== */
+PORT=3001
+TRAIN_INTERVAL_MS=5000
+BATCH_SIZE=64
+
+/* ===================================================================
+  6) frontend/package.json (Vite React minimal)
+=================================================================== */
+{
+  "name": "eurusd-predictor-frontend",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "recharts": "^2.6.2"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0",
+    "tailwindcss": "^4.0.0",
+    "postcss": "^8.4.0",
+    "autoprefixer": "^10.4.0"
+  }
+}
+
+/* ===================================================================
+  7) frontend/src/main.jsx
+=================================================================== */
+import React from 'react'
+import { createRoot } from 'react-dom/client'
+import App from './App'
+import './index.css'
+
+createRoot(document.getElementById('root')).render(<App />)
+
+/* ===================================================================
+  8) frontend/src/App.jsx
+=================================================================== */
+import React, { useEffect, useState } from 'react';
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
+import useWebsocket from './wsClient';
+
+export default function App(){
+  const [ticks, setTicks] = useState([]);
+  const [prediction, setPrediction] = useState(null);
+  const [metrics, setMetrics] = useState({ accuracy: 0 });
+  const ws = useWebsocket('ws://localhost:3001/ws');
+
+  useEffect(()=>{
+    if (!ws) return;
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'tick'){
+        setTicks(prev => {
+          const next = [...prev, { ts: msg.tick.ts || Date.now(), c: msg.tick.c }].slice(-200);
+          return next;
+        });
+        if (msg.prediction) setPrediction(msg.prediction);
+        if (msg.metrics) setMetrics(msg.metrics);
+      }
+      if (msg.type === 'metrics') setMetrics(msg.metrics);
+    };
+  },[ws]);
+
+  return (
+    <div className="min-h-screen bg-neutral-900 text-white p-6">
+      <div className="max-w-4xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div className="col-span-2 bg-neutral-800 p-4 rounded-2xl shadow-lg">
+          <h2 className="text-lg font-semibold mb-2">EUR/USD — Últimos 200 ticks (1m)</h2>
+          <div style={{ width: '100%', height: 320 }}>
+            <ResponsiveContainer>
+              <LineChart data={ticks}>
+                <XAxis dataKey="ts" tickFormatter={(t)=>new Date(t).toLocaleTimeString()} />
+                <YAxis domain={[dataMin=>dataMin*0.999, dataMax=>dataMax*1.001]} />
+                <Tooltip labelFormatter={(t)=>new Date(t).toLocaleTimeString()} />
+                <Line type="monotone" dataKey="c" strokeWidth={2} dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+
+        <div className="bg-neutral-800 p-4 rounded-2xl shadow-lg space-y-4">
+          <h2 className="text-lg font-semibold">Señal actual</h2>
+          <div className="text-center">
+            <div className="text-5xl font-bold">{prediction ? (prediction.raw>0? '↑ UP':'↓ DOWN') : '—'}</div>
+            <div className="text-sm mt-1">Raw: {prediction ? prediction.raw.toFixed(4) : '—'}</div>
+          </div>
+
+          <div className="pt-4">
+            <h3 className="text-sm">Precisión dinámica</h3>
+            <div className="text-3xl font-semibold">{(metrics.accuracy*100).toFixed(2)}%</div>
+            <div className="text-xs text-neutral-400">Ticks procesados: {metrics.totalTicks || 0}</div>
+          </div>
+
+          <div className="pt-4">
+            <button className="w-full bg-blue-600 py-2 rounded-xl">Forzar retrain</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ===================================================================
+  9) frontend/src/wsClient.js
+=================================================================== */
+import { useEffect, useRef, useState } from 'react';
+
+export default function useWebsocket(url){
+  const wsRef = useRef(null);
+  const [socket, setSocket] = useState(null);
+
+  useEffect(()=>{
+    let cont = true;
+    function connect(){
+      const s = new WebSocket(url);
+      s.onopen = ()=>console.log('ws open');
+      s.onclose = ()=>{ console.log('ws closed'); if (cont) setTimeout(connect, 2000); };
+      s.onerror = (e)=>console.error('ws err', e);
+      wsRef.current = s;
+      setSocket(s);
+    }
+    connect();
+    return ()=>{ cont=false; if (wsRef.current) wsRef.current.close(); };
+  },[url]);
+
+  return socket;
+}
+
+/* ===================================================================
+  10) frontend/index.html
+=================================================================== */
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EURUSD Predictor</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+
+/* ===================================================================
+  11) frontend/tailwind.config.cjs + postcss.config.cjs (minimal)
+=================================================================== */
+// tailwind.config.cjs
+module.exports = {
+  content: ['./index.html', './src/**/*.{js,jsx,ts,tsx}'],
+  theme: { extend: {} },
+  plugins: [],
+}
+
+// postcss.config.cjs
+module.exports = {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  }
+}
+
+/* ===================================================================
+  12) backtest/backtest_notebook.py
+  - Standalone script that loads CSV OHLC 1m data and backtests simple strategy
+=================================================================== */
+# backtest_notebook.py
+# Requires: pandas, numpy, matplotlib
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Load CSV (expected columns: ts, open, high, low, close, volume)
+# df = pd.read_csv('EURUSD_1m.csv', parse_dates=['ts'])
+# For demo create synthetic
+rng = pd.date_range('2024-01-01', periods=1000, freq='T')
+np.random.seed(42)
+price = 1.10 + np.cumsum(np.random.randn(len(rng))*0.0001)
+df = pd.DataFrame({'ts': rng, 'open': price, 'high': price+0.00005, 'low': price-0.00005, 'close': price, 'volume': 100})
+
+# features (same as server)
+
+def compute_features(df):
+    feats = []
+    for i in range(len(df)):
+        window = df[max(0,i-49):i+1]
+        last = window.iloc[-1]
+        o,h,l,c = last.open, last.high, last.low, last.close
+        rng_ = max(h-l, 1e-8)
+        normO = (o-c)/rng_
+        normH = (h-c)/rng_
+        normL = (l-c)/rng_
+        r1 = np.log((c+1e-8)/(window.iloc[-2].close+1e-8)) if len(window)>1 else 0
+        r2 = np.log((c+1e-8)/(window.iloc[-3].close+1e-8)) if len(window)>2 else 0
+        smaFast = window['close'].tail(5).mean()
+        smaSlow = window['close'].tail(20).mean()
+        smaDiff = smaFast - smaSlow
+        feats.append([normO,normH,normL,0,r1,r2,smaDiff,(c/(smaSlow or 1))-1])
+    return np.array(feats)
+
+feats = compute_features(df)
+
+# fake predictions: simple rule: if last return > 0 => buy
+pred = (feats[:,4] > 0).astype(int)
+# simulate returns next bar
+rets = np.zeros(len(df))
+rets[:-1] = df['close'].shift(-1) - df['close']
+
+# backtest: long 1 unit if pred==1, else flat. Accounting simple
+positions = pred
+pnl = positions * rets
+cum = np.cumsum(pnl)
+
+plt.figure(figsize=(10,4))
+plt.plot(df['ts'], cum)
+plt.title('Backtest PnL (synthetic)')
+plt.show()
+
+print('Total PnL', cum[-2])
+
+/* ===================================================================
+  13) scripts/simulate_ticks.js
+  - Node script to simulate ticks and POST to backend /tick for dev
+=================================================================== */
+// simulate_ticks.js
+const fetch = require('node-fetch');
+
+async function run(){
+  let price = 1.10;
+  for (let i=0;i<500;i++){
+    price += (Math.random()-0.5)*0.0002;
+    const tick = { o: price, h: price+0.00005, l: price-0.00005, c: price, volume: 100, ts: Date.now() };
+    await fetch('http://localhost:3001/tick', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(tick) });
+    await new Promise(r=>setTimeout(r, 200));
+  }
+}
+run();
+
+/* ===================================================================
+  14) README_FULL.md
+  - Quick start and next steps
+=================================================================== */
+# EURUSD Predictor — Full Project
+
+## Quick start (local)
+
+1) Backend
+
+```bash
+cd backend
+npm install
+cp .env.example .env
+npm run dev
+```
+
+2) Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+3) Simulate ticks (dev)
+
+```bash
+node scripts/simulate_ticks.js
+```
+
+## What you have
+- Backend that ingests ticks, stores samples in replay buffer, labels them when next tick arrives and trains periodically.
+- Frontend dashboard with real-time chart and dynamic accuracy display via WebSocket.
+- Backtest script to run an offline evaluation with CSV OHLC 1m (adaptable to your data).
+
+## Next improvements
+- Use persistent storage (Redis/Postgres) for buffer and metrics.
+- Replace simple labeling with thresholded moves to ignore noise.
+- Add probability calibration and risk management (stop loss, take profit, sizing).
+- Add authentication and secure WebSocket.
+
+---
+
+// End of combined file. Copy each section to its corresponding file in your project.
