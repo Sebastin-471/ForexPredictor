@@ -117,60 +117,47 @@ export async function registerRoutes(app: Express): Promise<Server> {
     res.json({ status: "stopped" });
   });
 
-  // Start the services automatically
-  tickSimulator.start();
-  candleAggregator.start();
-  predictionEngine.start();
-
-  // Set up real-time broadcasting
-  setInterval(async () => {
+  // Set up event-based real-time broadcasting (more efficient than polling)
+  // Register listeners before starting services to avoid missing early events
+  tickSimulator.on("tick", async (tick) => {
     try {
-      // Broadcast latest tick
-      const ticks = await storage.getRecentTicks(1);
-      if (ticks.length > 0) {
-        const tick = ticks[0];
-        
-        // Update candle aggregator
-        await candleAggregator.processTick(tick.mid);
-        
-        broadcast({
-          type: "tick",
-          data: tick,
-        });
-      }
-
-      // Broadcast current candle state
-      const currentCandle = candleAggregator.getCurrentCandle();
-      if (currentCandle) {
-        broadcast({
-          type: "candle_update",
-          data: currentCandle,
-        });
-      }
+      // Process tick in candle aggregator
+      await candleAggregator.processTick(tick.mid);
+      
+      // Broadcast tick to all clients
+      broadcast({
+        type: "tick",
+        data: tick,
+      });
     } catch (error) {
-      console.error("[Broadcast] Error:", error);
+      console.error("[Broadcast Tick] Error:", error);
     }
-  }, 500); // Every 500ms
+  });
 
-  // Broadcast new signals
-  setInterval(async () => {
-    try {
-      const signals = await storage.getRecentSignals(1);
-      if (signals.length > 0) {
-        broadcast({
-          type: "signal",
-          data: signals[0],
-        });
-      }
-    } catch (error) {
-      console.error("[Broadcast Signal] Error:", error);
+  // Throttle candle updates to once per second to reduce network traffic
+  let lastCandleBroadcast = 0;
+  const CANDLE_BROADCAST_THROTTLE = 1000; // 1 second
+
+  candleAggregator.on("candle_update", (candle) => {
+    const now = Date.now();
+    if (now - lastCandleBroadcast >= CANDLE_BROADCAST_THROTTLE) {
+      lastCandleBroadcast = now;
+      broadcast({
+        type: "candle_update",
+        data: candle,
+      });
     }
-  }, 5000); // Every 5 seconds
+  });
 
-  // Broadcast metrics update
-  setInterval(async () => {
+  predictionEngine.on("signal", (signal) => {
+    broadcast({
+      type: "signal",
+      data: signal,
+    });
+  });
+
+  predictionEngine.on("metrics", async (metric) => {
     try {
-      const metric = await storage.getLatestMetric();
       const dynamicSuccessRate = await predictionEngine.getDynamicSuccessRate();
       
       broadcast({
@@ -183,7 +170,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error) {
       console.error("[Broadcast Metrics] Error:", error);
     }
-  }, 10000); // Every 10 seconds
+  });
+
+  // Start the services after event listeners are registered
+  tickSimulator.start();
+  candleAggregator.start();
+  predictionEngine.start();
 
   async function sendInitialState(ws: WebSocket) {
     try {
