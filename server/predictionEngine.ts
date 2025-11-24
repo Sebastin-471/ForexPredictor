@@ -5,8 +5,8 @@ import { replayBuffer } from "./replayBuffer";
 import { type Signal } from "@shared/schema";
 import { EventEmitter } from "events";
 
-const PREDICTION_INTERVAL_MS = 5000; // 5 seconds for fast testing (change to 60000 for 1-minute predictions)
-const VERIFICATION_DELAY_MS = 5000; // 5 seconds for fast testing (change to 60000 for 1-minute verification)
+const PREDICTION_INTERVAL_MS = 60000; // 1 minute predictions
+const VERIFICATION_DELAY_MS = 60000; // 1 minute verification
 
 export class PredictionEngine extends EventEmitter {
   private isRunning = false;
