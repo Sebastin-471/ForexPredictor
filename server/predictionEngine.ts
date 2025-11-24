@@ -1,6 +1,7 @@
 import { storage } from "./storage";
 import { featureEngine } from "./featureEngine";
-import { mlModel } from "./mlModel";
+import { tfModel } from "./tfModel";
+import { replayBuffer } from "./replayBuffer";
 import { type Signal } from "@shared/schema";
 import { EventEmitter } from "events";
 
@@ -8,25 +9,31 @@ export class PredictionEngine extends EventEmitter {
   private isRunning = false;
   private intervalId: NodeJS.Timeout | null = null;
   private checkIntervalId: NodeJS.Timeout | null = null;
-  private pendingSignals: Map<string, { timestamp: Date; price: number }> = new Map();
-  private signalsSinceRetrain = 0;
-  private readonly retrainInterval = 50; // Retrain every 50 predictions
+  private trainingIntervalId: NodeJS.Timeout | null = null;
+  private pendingSignals: Map<string, { timestamp: Date; price: number; bufferSampleId: string }> = new Map();
+  private readonly trainingInterval = 10000; // Train every 10 seconds
+  private readonly batchSize = 64;
 
   start() {
     if (this.isRunning) return;
     
     this.isRunning = true;
-    console.log("[PredictionEngine] Starting prediction engine...");
+    console.log("[PredictionEngine] Starting prediction engine with TensorFlow.js...");
     
     // Generate predictions every minute
     this.intervalId = setInterval(async () => {
       await this.generatePrediction();
     }, 60000); // Every 60 seconds
     
-    // Also check for completed predictions
+    // Check for completed predictions
     this.checkIntervalId = setInterval(async () => {
       await this.checkCompletedPredictions();
     }, 5000); // Every 5 seconds
+    
+    // Background training loop
+    this.trainingIntervalId = setInterval(async () => {
+      await this.trainModelOnBatch();
+    }, this.trainingInterval);
   }
 
   stop() {
@@ -40,6 +47,10 @@ export class PredictionEngine extends EventEmitter {
     if (this.checkIntervalId) {
       clearInterval(this.checkIntervalId);
       this.checkIntervalId = null;
+    }
+    if (this.trainingIntervalId) {
+      clearInterval(this.trainingIntervalId);
+      this.trainingIntervalId = null;
     }
     console.log("[PredictionEngine] Stopped prediction engine.");
   }
@@ -65,8 +76,8 @@ export class PredictionEngine extends EventEmitter {
       // Convert to array
       const featureArray = featureEngine.featuresToArray(features);
       
-      // Make prediction
-      const prediction = mlModel.predict(featureArray);
+      // Make prediction with TensorFlow model
+      const prediction = await tfModel.predict(featureArray);
       
       // Get current price
       const latestCandle = candles[candles.length - 1];
@@ -75,19 +86,29 @@ export class PredictionEngine extends EventEmitter {
       // Store signal
       const signal = await storage.createSignal({
         direction: prediction.direction,
-        probability: prediction.probability,
-        modelVersion: mlModel.getModelVersion(),
+        probability: prediction.confidence,
+        modelVersion: tfModel.getModelVersion(),
         features: JSON.stringify(features),
         priceAtPrediction: currentPrice,
+      });
+      
+      // Add pending sample to replay buffer (label will be set later)
+      const bufferSampleId = signal.id; // Use signal ID as buffer sample ID
+      replayBuffer.add({
+        id: bufferSampleId,
+        features: featureArray,
+        label: null,
+        createdAt: Date.now(),
       });
       
       // Track pending signal for later verification
       this.pendingSignals.set(signal.id, {
         timestamp: signal.timestamp,
         price: currentPrice,
+        bufferSampleId,
       });
       
-      console.log(`[PredictionEngine] Generated ${prediction.direction} signal with ${(prediction.probability * 100).toFixed(1)}% confidence at price ${currentPrice.toFixed(5)}`);
+      console.log(`[PredictionEngine] Generated ${prediction.direction} signal with ${(prediction.confidence * 100).toFixed(1)}% confidence at price ${currentPrice.toFixed(5)}`);
       
       this.emit("signal", signal);
       
@@ -105,26 +126,16 @@ export class PredictionEngine extends EventEmitter {
       const elapsed = now.getTime() - signalInfo.timestamp.getTime();
       
       if (elapsed >= 60000) { // 60 seconds
-        await this.verifyPrediction(signalId, signalInfo.price);
+        await this.verifyPrediction(signalId, signalInfo.price, signalInfo.bufferSampleId);
         completedIds.push(signalId);
       }
     }
     
     // Remove completed signals
     completedIds.forEach(id => this.pendingSignals.delete(id));
-    
-    // Check if we should retrain
-    if (completedIds.length > 0) {
-      this.signalsSinceRetrain += completedIds.length;
-      
-      if (this.signalsSinceRetrain >= this.retrainInterval) {
-        await this.retrainModel();
-        this.signalsSinceRetrain = 0;
-      }
-    }
   }
 
-  private async verifyPrediction(signalId: string, predictedPrice: number) {
+  private async verifyPrediction(signalId: string, predictedPrice: number, bufferSampleId: string) {
     try {
       // Get current price (from latest candle)
       const latestCandle = await storage.getLatestCandle();
@@ -148,11 +159,11 @@ export class PredictionEngine extends EventEmitter {
       
       console.log(`[PredictionEngine] Verified signal ${signalId}: Predicted ${signal.direction}, Actual ${actualDirection}, ${isCorrect ? "✓ CORRECT" : "✗ INCORRECT"}`);
       
-      // Add to training data
-      if (signal.features) {
-        const features = JSON.parse(signal.features);
-        const featureArray = featureEngine.featuresToArray(features);
-        mlModel.addTrainingExample(featureArray, actualDirection);
+      // Label the corresponding replay buffer sample
+      const bufferSample = replayBuffer.findById(bufferSampleId);
+      if (bufferSample && bufferSample.label === null) {
+        bufferSample.label = actualDirection === "UP" ? 1 : 0;
+        console.log(`[PredictionEngine] Labeled training sample ${bufferSampleId}: ${actualDirection} (${bufferSample.label})`);
       }
       
       // Update metrics
@@ -163,9 +174,29 @@ export class PredictionEngine extends EventEmitter {
     }
   }
 
-  private async retrainModel() {
-    console.log("[PredictionEngine] Triggering model retraining...");
-    mlModel.train();
+  private async trainModelOnBatch() {
+    try {
+      const labeledCount = replayBuffer.getLabeledCount();
+      
+      if (labeledCount < 32) {
+        return; // Not enough labeled data
+      }
+      
+      // Sample batch from replay buffer
+      const batch = replayBuffer.sampleWithLabels(this.batchSize);
+      
+      if (batch.length < 16) {
+        return;
+      }
+      
+      const features = batch.map(sample => sample.features);
+      const labels = batch.map(sample => sample.label as number);
+      
+      await tfModel.trainOnBatch(features, labels);
+      
+    } catch (error) {
+      console.error("[PredictionEngine] Error in training loop:", error);
+    }
   }
 
   private async updateMetrics() {
@@ -187,7 +218,7 @@ export class PredictionEngine extends EventEmitter {
       const recall = actualUpSignals > 0 ? correctUpSignals / actualUpSignals : 0;
       
       const metric = await storage.createModelMetric({
-        modelVersion: mlModel.getModelVersion(),
+        modelVersion: tfModel.getModelVersion(),
         accuracy,
         precision,
         recall,
