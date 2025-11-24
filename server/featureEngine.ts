@@ -30,7 +30,7 @@ export interface TechnicalFeatures {
 
 export class FeatureEngine {
   calculateFeatures(candles: Candle[]): TechnicalFeatures | null {
-    if (candles.length < 20) {
+    if (candles.length < 5) {
       return null; // Not enough data
     }
     

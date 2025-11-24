@@ -5,6 +5,9 @@ import { replayBuffer } from "./replayBuffer";
 import { type Signal } from "@shared/schema";
 import { EventEmitter } from "events";
 
+const PREDICTION_INTERVAL_MS = 5000; // 5 seconds for fast testing (change to 60000 for 1-minute predictions)
+const VERIFICATION_DELAY_MS = 5000; // 5 seconds for fast testing (change to 60000 for 1-minute verification)
+
 export class PredictionEngine extends EventEmitter {
   private isRunning = false;
   private intervalId: NodeJS.Timeout | null = null;
@@ -18,17 +21,17 @@ export class PredictionEngine extends EventEmitter {
     if (this.isRunning) return;
     
     this.isRunning = true;
-    console.log("[PredictionEngine] Starting prediction engine with TensorFlow.js...");
+    console.log(`[PredictionEngine] Starting prediction engine (${PREDICTION_INTERVAL_MS / 1000}s intervals)...`);
     
-    // Generate predictions every minute
+    // Generate predictions at the specified interval
     this.intervalId = setInterval(async () => {
       await this.generatePrediction();
-    }, 60000); // Every 60 seconds
+    }, PREDICTION_INTERVAL_MS);
     
-    // Check for completed predictions
+    // Check for completed predictions every second
     this.checkIntervalId = setInterval(async () => {
       await this.checkCompletedPredictions();
-    }, 5000); // Every 5 seconds
+    }, 1000);
     
     // Background training loop
     this.trainingIntervalId = setInterval(async () => {
@@ -60,8 +63,8 @@ export class PredictionEngine extends EventEmitter {
       // Get recent candles for feature calculation
       const candles = await storage.getRecentCandles(100);
       
-      if (candles.length < 20) {
-        console.log("[PredictionEngine] Not enough candles for prediction");
+      if (candles.length < 5) {
+        console.log(`[PredictionEngine] Not enough candles for prediction (${candles.length}/5)`);
         return;
       }
       
@@ -125,7 +128,7 @@ export class PredictionEngine extends EventEmitter {
       // Check if 1 minute has passed
       const elapsed = now.getTime() - signalInfo.timestamp.getTime();
       
-      if (elapsed >= 60000) { // 60 seconds
+      if (elapsed >= VERIFICATION_DELAY_MS) {
         await this.verifyPrediction(signalId, signalInfo.price, signalInfo.bufferSampleId);
         completedIds.push(signalId);
       }

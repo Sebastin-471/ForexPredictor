@@ -2,6 +2,8 @@ import { storage } from "./storage";
 import { EventEmitter } from "events";
 import { type Candle, type Tick } from "@shared/schema";
 
+const CANDLE_INTERVAL_MS = 5000; // 5 seconds for fast testing (change to 60000 for 1-minute candles)
+
 export class CandleAggregator extends EventEmitter {
   private currentCandle: {
     open: number;
@@ -14,17 +16,19 @@ export class CandleAggregator extends EventEmitter {
   
   private isRunning = false;
   private intervalId: NodeJS.Timeout | null = null;
+  private candleStartTime: number = 0;
 
   start() {
     if (this.isRunning) return;
     
     this.isRunning = true;
-    console.log("[CandleAggregator] Starting candle aggregation...");
+    this.candleStartTime = Date.now();
+    console.log(`[CandleAggregator] Starting candle aggregation (${CANDLE_INTERVAL_MS / 1000}s candles)...`);
     
-    // Check every second if we need to close the current candle
+    // Check every 500ms if we need to close the current candle
     this.intervalId = setInterval(async () => {
       await this.checkAndCloseCandle();
-    }, 1000);
+    }, 500);
   }
 
   stop() {
@@ -41,8 +45,7 @@ export class CandleAggregator extends EventEmitter {
   async processTick(price: number) {
     if (!this.currentCandle) {
       // Start new candle
-      const now = new Date();
-      now.setSeconds(0, 0); // Round to the start of the minute
+      this.candleStartTime = Date.now();
       
       this.currentCandle = {
         open: price,
@@ -50,7 +53,7 @@ export class CandleAggregator extends EventEmitter {
         low: price,
         close: price,
         volume: 1,
-        startTime: now,
+        startTime: new Date(this.candleStartTime),
       };
     } else {
       // Update current candle
@@ -66,12 +69,10 @@ export class CandleAggregator extends EventEmitter {
   private async checkAndCloseCandle() {
     if (!this.currentCandle) return;
     
-    const now = new Date();
-    const currentMinute = new Date(now);
-    currentMinute.setSeconds(0, 0);
+    const now = Date.now();
     
-    // If we've moved to a new minute, close the current candle
-    if (currentMinute.getTime() > this.currentCandle.startTime.getTime()) {
+    // If the candle interval has passed, close the current candle
+    if (now - this.candleStartTime >= CANDLE_INTERVAL_MS) {
       await this.closeCandle();
     }
   }
