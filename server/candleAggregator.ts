@@ -1,6 +1,8 @@
 import { storage } from "./storage";
+import { EventEmitter } from "events";
+import { type Candle, type Tick } from "@shared/schema";
 
-export class CandleAggregator {
+export class CandleAggregator extends EventEmitter {
   private currentCandle: {
     open: number;
     high: number;
@@ -57,6 +59,8 @@ export class CandleAggregator {
       this.currentCandle.close = price;
       this.currentCandle.volume += 1;
     }
+    
+    this.emit("candle_update", this.currentCandle);
   }
 
   private async checkAndCloseCandle() {
@@ -76,7 +80,7 @@ export class CandleAggregator {
     if (!this.currentCandle) return;
     
     try {
-      await storage.createCandle({
+      const candle = await storage.createCandle({
         timestamp: this.currentCandle.startTime,
         open: this.currentCandle.open,
         high: this.currentCandle.high,
@@ -86,6 +90,8 @@ export class CandleAggregator {
       });
       
       console.log(`[CandleAggregator] Closed candle at ${this.currentCandle.startTime.toISOString()}: O=${this.currentCandle.open.toFixed(5)} H=${this.currentCandle.high.toFixed(5)} L=${this.currentCandle.low.toFixed(5)} C=${this.currentCandle.close.toFixed(5)}`);
+      
+      this.emit("candle_closed", candle);
     } catch (error) {
       console.error("[CandleAggregator] Error creating candle:", error);
     }

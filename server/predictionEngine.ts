@@ -2,10 +2,12 @@ import { storage } from "./storage";
 import { featureEngine } from "./featureEngine";
 import { mlModel } from "./mlModel";
 import { type Signal } from "@shared/schema";
+import { EventEmitter } from "events";
 
-export class PredictionEngine {
+export class PredictionEngine extends EventEmitter {
   private isRunning = false;
   private intervalId: NodeJS.Timeout | null = null;
+  private checkIntervalId: NodeJS.Timeout | null = null;
   private pendingSignals: Map<string, { timestamp: Date; price: number }> = new Map();
   private signalsSinceRetrain = 0;
   private readonly retrainInterval = 50; // Retrain every 50 predictions
@@ -22,7 +24,7 @@ export class PredictionEngine {
     }, 60000); // Every 60 seconds
     
     // Also check for completed predictions
-    setInterval(async () => {
+    this.checkIntervalId = setInterval(async () => {
       await this.checkCompletedPredictions();
     }, 5000); // Every 5 seconds
   }
@@ -34,6 +36,10 @@ export class PredictionEngine {
     if (this.intervalId) {
       clearInterval(this.intervalId);
       this.intervalId = null;
+    }
+    if (this.checkIntervalId) {
+      clearInterval(this.checkIntervalId);
+      this.checkIntervalId = null;
     }
     console.log("[PredictionEngine] Stopped prediction engine.");
   }
@@ -82,6 +88,8 @@ export class PredictionEngine {
       });
       
       console.log(`[PredictionEngine] Generated ${prediction.direction} signal with ${(prediction.probability * 100).toFixed(1)}% confidence at price ${currentPrice.toFixed(5)}`);
+      
+      this.emit("signal", signal);
       
     } catch (error) {
       console.error("[PredictionEngine] Error generating prediction:", error);
@@ -178,7 +186,7 @@ export class PredictionEngine {
       const precision = upSignals.length > 0 ? correctUpSignals / upSignals.length : 0;
       const recall = actualUpSignals > 0 ? correctUpSignals / actualUpSignals : 0;
       
-      await storage.createModelMetric({
+      const metric = await storage.createModelMetric({
         modelVersion: mlModel.getModelVersion(),
         accuracy,
         precision,
@@ -187,6 +195,8 @@ export class PredictionEngine {
         correctSignals,
         windowSize: 100,
       });
+      
+      this.emit("metrics", metric);
       
     } catch (error) {
       console.error("[PredictionEngine] Error updating metrics:", error);

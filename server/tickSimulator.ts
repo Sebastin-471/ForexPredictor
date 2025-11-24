@@ -1,6 +1,8 @@
 import { storage } from "./storage";
+import { EventEmitter } from "events";
+import { type Tick } from "@shared/schema";
 
-export class TickSimulator {
+export class TickSimulator extends EventEmitter {
   private basePrice = 1.08500;
   private volatility = 0.0001;
   private trend = 0.00001;
@@ -46,11 +48,13 @@ export class TickSimulator {
     const mid = (bid + ask) / 2;
     
     try {
-      await storage.createTick({
+      const tick = await storage.createTick({
         bid,
         ask,
         mid,
       });
+      
+      this.emit("tick", tick);
     } catch (error) {
       console.error("[TickSimulator] Error creating tick:", error);
     }

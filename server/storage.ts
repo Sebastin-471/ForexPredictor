@@ -69,9 +69,9 @@ export class MemStorage implements IStorage {
       mid: insertTick.mid,
     };
     this.ticks.push(tick);
-    // Keep only last 10000 ticks in memory
-    if (this.ticks.length > 10000) {
-      this.ticks = this.ticks.slice(-10000);
+    // Keep only last 1000 ticks in memory (~100 seconds at 10 ticks/sec)
+    if (this.ticks.length > 1000) {
+      this.ticks = this.ticks.slice(-1000);
     }
     return tick;
   }
