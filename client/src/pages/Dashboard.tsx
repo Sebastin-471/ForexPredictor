@@ -76,7 +76,7 @@ export default function Dashboard() {
       }
 
       if (data.candles && data.candles.length > 0) {
-        setCandles(data.candles);
+        setCandles([...data.candles].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()));
       }
     });
 
@@ -86,20 +86,26 @@ export default function Dashboard() {
         const existingIndex = prev.findIndex(
           (c) => new Date(c.timestamp).getTime() === new Date(candle.timestamp).getTime()
         );
+        let updated;
         if (existingIndex >= 0) {
-          const updated = [...prev];
+          updated = [...prev];
           updated[existingIndex] = candle;
-          return updated;
+        } else {
+          updated = [...prev, candle];
         }
-        return [...prev, candle].slice(-50);
+        // Ensure strictly sorted and limited to last 50
+        return updated
+          .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
+          .slice(-50);
       });
     });
 
     // Tick listener
     wsClient.on("tick", (tick: any) => {
       const newPrice = tick.mid;
-      const change = newPrice - currentPrice;
-      const changePercent = (change / currentPrice) * 100;
+      const prevPrice = currentPrice || tick.mid;
+      const change = newPrice - prevPrice;
+      const changePercent = prevPrice !== 0 ? (change / prevPrice) * 100 : 0;
       
       setCurrentPrice(newPrice);
       setPriceChange(change);
@@ -111,7 +117,12 @@ export default function Dashboard() {
     wsClient.on("signal", (signal: Signal) => {
       console.log("[Dashboard] New signal:", signal);
       setLatestSignal(signal);
-      setSignals((prev) => [signal, ...prev].slice(0, 20));
+      setSignals((prev) => {
+        const updated = [signal, ...prev];
+        return updated
+          .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+          .slice(0, 20);
+      });
     });
 
     // Metrics listener

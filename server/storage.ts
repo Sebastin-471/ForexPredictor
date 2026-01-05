@@ -1,5 +1,7 @@
-import { type User, type InsertUser, type Tick, type InsertTick, type Candle, type InsertCandle, type Signal, type InsertSignal, type ModelMetric, type InsertModelMetric } from "@shared/schema";
+import { type User, type InsertUser, type Tick, type InsertTick, type Candle, type InsertCandle, type Signal, type InsertSignal, type ModelMetric, type InsertModelMetric, users, ticks, candles, signals, modelMetrics } from "@shared/schema";
 import { randomUUID } from "crypto";
+import { db } from "./db";
+import { eq, desc, sql } from "drizzle-orm";
 
 export interface IStorage {
   getUser(id: string): Promise<User | undefined>;
@@ -170,4 +172,81 @@ export class MemStorage implements IStorage {
   }
 }
 
-export const storage = new MemStorage();
+export class DatabaseStorage implements IStorage {
+  async getUser(id: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.id, id));
+    return user;
+  }
+
+  async getUserByUsername(username: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.username, username));
+    return user;
+  }
+
+  async createUser(insertUser: InsertUser): Promise<User> {
+    const [user] = await db.insert(users).values(insertUser).returning();
+    return user;
+  }
+
+  // Ticks
+  async createTick(insertTick: InsertTick): Promise<Tick> {
+    const [tick] = await db.insert(ticks).values(insertTick).returning();
+    return tick;
+  }
+
+  async getRecentTicks(limit: number): Promise<Tick[]> {
+    return await db.select().from(ticks).orderBy(desc(ticks.timestamp)).limit(limit);
+  }
+
+  // Candles
+  async createCandle(insertCandle: InsertCandle): Promise<Candle> {
+    const [candle] = await db.insert(candles).values(insertCandle).returning();
+    return candle;
+  }
+
+  async getRecentCandles(limit: number): Promise<Candle[]> {
+    return await db.select().from(candles).orderBy(desc(candles.timestamp)).limit(limit);
+  }
+
+  async getLatestCandle(): Promise<Candle | undefined> {
+    const [candle] = await db.select().from(candles).orderBy(desc(candles.timestamp)).limit(1);
+    return candle;
+  }
+
+  // Signals
+  async createSignal(insertSignal: InsertSignal): Promise<Signal> {
+    const [signal] = await db.insert(signals).values(insertSignal).returning();
+    return signal;
+  }
+
+  async getRecentSignals(limit: number): Promise<Signal[]> {
+    return await db.select().from(signals).orderBy(desc(signals.timestamp)).limit(limit);
+  }
+
+  async updateSignalResult(id: string, actualDirection: string, isCorrect: boolean, priceAfterMinute: number): Promise<void> {
+    await db.update(signals)
+      .set({ actualDirection, isCorrect, priceAfterMinute })
+      .where(eq(signals.id, id));
+  }
+
+  async getSignalsForMetrics(windowSize: number): Promise<Signal[]> {
+    return await db.select()
+      .from(signals)
+      .where(sql`${signals.isCorrect} IS NOT NULL`)
+      .orderBy(desc(signals.timestamp))
+      .limit(windowSize);
+  }
+
+  // Model Metrics
+  async createModelMetric(insertMetric: InsertModelMetric): Promise<ModelMetric> {
+    const [metric] = await db.insert(modelMetrics).values(insertMetric).returning();
+    return metric;
+  }
+
+  async getLatestMetric(): Promise<ModelMetric | undefined> {
+    const [metric] = await db.select().from(modelMetrics).orderBy(desc(modelMetrics.timestamp)).limit(1);
+    return metric;
+  }
+}
+
+export const storage = new DatabaseStorage();

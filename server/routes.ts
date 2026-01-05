@@ -188,9 +188,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       ws.send(JSON.stringify({
         type: "initial_state",
         data: {
-          ticks,
-          candles,
-          signals,
+          ticks: [...ticks].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()),
+          candles: [...candles].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()),
+          signals: [...signals].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()),
           metrics: {
             ...metric,
             dynamicSuccessRate,

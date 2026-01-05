@@ -1,4 +1,4 @@
-import * as tf from '@tensorflow/tfjs-node';
+import * as tf from "@tensorflow/tfjs";
 
 export interface PredictionResult {
   direction: "UP" | "DOWN";
@@ -11,7 +11,7 @@ export class TFModel {
   private modelVersion = "v2.0.0-tensorflow";
   private inputSize: number;
   private isTraining = false;
-  
+
   constructor(inputSize: number = 18) {
     this.inputSize = inputSize;
     this.initializeModel();
@@ -23,43 +23,43 @@ export class TFModel {
         // First hidden layer with more neurons
         tf.layers.dense({
           units: 64,
-          activation: 'relu',
+          activation: "relu",
           inputShape: [this.inputSize],
-          kernelInitializer: 'heNormal',
-          kernelRegularizer: tf.regularizers.l2({ l2: 0.001 })
+          kernelInitializer: "heNormal",
+          kernelRegularizer: tf.regularizers.l2({ l2: 0.001 }),
         }),
         tf.layers.dropout({ rate: 0.3 }),
-        
+
         // Second hidden layer
         tf.layers.dense({
           units: 32,
-          activation: 'relu',
-          kernelInitializer: 'heNormal',
-          kernelRegularizer: tf.regularizers.l2({ l2: 0.001 })
+          activation: "relu",
+          kernelInitializer: "heNormal",
+          kernelRegularizer: tf.regularizers.l2({ l2: 0.001 }),
         }),
         tf.layers.dropout({ rate: 0.2 }),
-        
+
         // Third hidden layer
         tf.layers.dense({
           units: 16,
-          activation: 'relu',
-          kernelInitializer: 'heNormal'
+          activation: "relu",
+          kernelInitializer: "heNormal",
         }),
-        
+
         // Output layer (binary classification)
         tf.layers.dense({
           units: 1,
-          activation: 'sigmoid',
-          kernelInitializer: 'glorotNormal'
-        })
-      ]
+          activation: "sigmoid",
+          kernelInitializer: "glorotNormal",
+        }),
+      ],
     });
 
     // Compile with Adam optimizer
     this.model.compile({
       optimizer: tf.train.adam(0.001),
-      loss: 'binaryCrossentropy',
-      metrics: ['accuracy']
+      loss: "binaryCrossentropy",
+      metrics: ["accuracy"],
     });
 
     console.log("[TFModel] Initialized deep neural network");
@@ -75,16 +75,14 @@ export class TFModel {
       const input = tf.tensor2d([features], [1, this.inputSize]);
       const prediction = this.model!.predict(input) as tf.Tensor;
       const probability = prediction.dataSync()[0];
-      
+
       const direction: "UP" | "DOWN" = probability >= 0.5 ? "UP" : "DOWN";
-      const confidence = direction === "UP" 
-        ? probability 
-        : 1 - probability;
+      const confidence = direction === "UP" ? probability : 1 - probability;
 
       return {
         direction,
         probability,
-        confidence
+        confidence,
       };
     });
   }
@@ -117,22 +115,32 @@ export class TFModel {
     this.isTraining = true;
 
     try {
-      const xs = tf.tensor2d(featuresArray, [featuresArray.length, this.inputSize]);
-      const ys = tf.tensor2d(labels.map(l => [l]), [labels.length, 1]);
+      const xs = tf.tensor2d(featuresArray, [
+        featuresArray.length,
+        this.inputSize,
+      ]);
+      const ys = tf.tensor2d(
+        labels.map((l) => [l]),
+        [labels.length, 1]
+      );
 
       const history = await this.model.fit(xs, ys, {
         epochs: 5,
         batchSize: Math.min(32, featuresArray.length),
         shuffle: true,
-        verbose: 0
+        verbose: 0,
       });
 
       const loss = history.history.loss[history.history.loss.length - 1];
-      const acc = history.history.acc ? history.history.acc[history.history.acc.length - 1] : 0;
-      
+      const acc = history.history.acc
+        ? history.history.acc[history.history.acc.length - 1]
+        : 0;
+
       console.log(
         `[TFModel] Trained on ${featuresArray.length} samples - ` +
-        `Loss: ${(loss as number).toFixed(4)}, Acc: ${(acc as number).toFixed(4)}`
+          `Loss: ${(loss as number).toFixed(4)}, Acc: ${(acc as number).toFixed(
+            4
+          )}`
       );
 
       // Clean up tensors
@@ -140,9 +148,10 @@ export class TFModel {
       ys.dispose();
 
       // Update version
-      const versionNum = parseInt(this.modelVersion.split('.')[2].split('-')[0]);
+      const versionNum = parseInt(
+        this.modelVersion.split(".")[2].split("-")[0]
+      );
       this.modelVersion = `v2.0.${versionNum + 1}-tensorflow`;
-
     } catch (error) {
       console.error("[TFModel] Training error:", error);
     } finally {
