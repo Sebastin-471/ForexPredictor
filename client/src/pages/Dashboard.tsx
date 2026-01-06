@@ -76,7 +76,12 @@ export default function Dashboard() {
       }
 
       if (data.candles && data.candles.length > 0) {
-        setCandles([...data.candles].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()));
+        const sorted = [...data.candles].sort((a, b) => {
+          const timeA = new Date(a.timestamp).getTime();
+          const timeB = new Date(b.timestamp).getTime();
+          return timeA - timeB;
+        });
+        setCandles(sorted);
       }
     });
 
@@ -93,7 +98,7 @@ export default function Dashboard() {
         } else {
           updated = [...prev, candle];
         }
-        // Ensure strictly sorted and limited to last 50
+        // Ensure strictly sorted and limited to last 50 (Oldest to Newest)
         return updated
           .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
           .slice(-50);
