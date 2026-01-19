@@ -8,9 +8,10 @@ import ConnectionStatus from "@/components/ConnectionStatus";
 import PerformanceMetrics from "@/components/PerformanceMetrics";
 import ControlPanel from "@/components/ControlPanel";
 import ThemeToggle from "@/components/ThemeToggle";
-import { Activity, Target, Zap } from "lucide-react";
+import { Activity, Target, Zap, Volume2 } from "lucide-react";
 import { wsClient } from "@/lib/websocket";
 import { type Signal, type Candle } from "@shared/schema";
+import { playNotificationSound } from "@/lib/audio";
 
 interface MetricsData {
   accuracy: number;
@@ -120,7 +121,13 @@ export default function Dashboard() {
 
     // Signal listener
     wsClient.on("signal", (signal: Signal) => {
-      console.log("[Dashboard] New signal:", signal);
+      console.log("[Dashboard] New signal received:", signal);
+      
+      // Play sound for high confidence signals
+      if (signal.probability >= 0.9) {
+        playNotificationSound();
+      }
+
       setLatestSignal(signal);
       setSignals((prev) => {
         const updated = [signal, ...prev];
@@ -199,6 +206,13 @@ export default function Dashboard() {
           </div>
           
           <div className="flex items-center gap-2">
+            <button 
+              onClick={() => playNotificationSound()}
+              className="p-2 hover:bg-accent rounded-full transition-colors"
+              title="Probar sonido de notificación"
+            >
+              <Volume2 className="w-5 h-5 text-muted-foreground" />
+            </button>
             <ControlPanel 
               onPlayPause={handlePlayPause}
             />
